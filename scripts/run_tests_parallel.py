@@ -340,6 +340,47 @@ def _run_one_file(
         # Treat as a pass; surface info in a slightly distinct status
         # so the operator can spot it.
         rc = 0
+    # TOCTOU guard: a concurrent file's subprocess (running in the same
+    # ``-j N`` wave) can momentarily perturb the working tree — e.g. a test
+    # that stashes/cleans/recreates files — so pytest occasionally reports a
+    # freshly-discovered file as "file or directory not found" (usage error,
+    # exit 4) even though the file is present before and after. This is a
+    # filesystem race in the runner, not a real test failure. If the file
+    # still exists on disk, re-run the subprocess once before believing it.
+    if (
+        rc == 4
+        and "file or directory not found" in output.lower()
+        and file.exists()
+    ):
+        time.sleep(0.5)
+        retry_proc = subprocess.Popen(
+            cmd,
+            cwd=repo_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+        retry_pgid: int | None = None
+        if sys.platform != "win32":
+            try:
+                retry_pgid = os.getpgid(retry_proc.pid)
+            except (ProcessLookupError, PermissionError):
+                retry_pgid = None
+        try:
+            output, _ = retry_proc.communicate(timeout=file_timeout)
+            rc = retry_proc.returncode
+        except subprocess.TimeoutExpired:
+            _kill_tree(retry_proc, pgid=retry_pgid)
+            try:
+                output, _ = retry_proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                output = "(file timeout exceeded; output unavailable)"
+            rc = 124
+        else:
+            _kill_tree(retry_proc, pgid=retry_pgid)
+        if rc == 5:
+            rc = 0
     summary = _parse_pytest_summary(output)
     subproc_wall = time.monotonic() - subproc_start
     return file, rc, output, summary, subproc_wall
