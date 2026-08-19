@@ -1214,3 +1214,187 @@ def compute_task_diagnostics(
         )
     )
     return out
+
+
+def compute_board_diagnostics(conn, *, config: Optional[dict] = None) -> list[Diagnostic]:
+    """Return read-only integrity diagnostics that require board-wide state."""
+    import hashlib
+
+    diagnostics: list[Diagnostic] = []
+    rules = (
+        ("idempotency_key", "duplicate_active_idempotency_key"),
+        ("route_fingerprint", "duplicate_active_route"),
+    )
+    for column, kind in rules:
+        try:
+            groups = conn.execute(
+                f"SELECT {column} value, count(*) count, group_concat(id) task_ids "
+                "FROM tasks WHERE "
+                f"{column} IS NOT NULL AND status NOT IN ('archived','superseded') "
+                f"GROUP BY {column} HAVING count(*) > 1 ORDER BY {column}"
+            ).fetchall()
+        except Exception:
+            continue
+        for group in groups:
+            task_ids = sorted(str(group["task_ids"] or "").split(","))
+            diagnostics.append(
+                Diagnostic(
+                    kind=kind,
+                    severity="critical",
+                    title=f"{len(task_ids)} active tasks share one {column}",
+                    detail=(
+                        "Competing active routes can dispatch independently. "
+                        "Quarantine the group and repair it through the supported "
+                        "canonical-route operation."
+                    ),
+                    data={
+                        "task_ids": task_ids,
+                        "value_sha256": hashlib.sha256(
+                            str(group["value"]).encode("utf-8")
+                        ).hexdigest(),
+                    },
+                )
+            )
+
+    try:
+        indexes = {
+            row["name"]
+            for row in conn.execute("PRAGMA index_list('tasks')").fetchall()
+            if bool(row["unique"])
+        }
+        required = {"idx_tasks_idem_active", "idx_tasks_route_active"}
+        if not required.issubset(indexes):
+            diagnostics.append(
+                Diagnostic(
+                    kind="uniqueness_not_enforced",
+                    severity="warning",
+                    title="Board Integrity uniqueness indexes are not enforced",
+                    detail="Resolve duplicates before enabling integrity indexes.",
+                    data={"missing_indexes": sorted(required - indexes)},
+                )
+            )
+    except Exception:
+        pass
+
+    # Per-task integrity rules stay here (rather than in the UI) so CLI and
+    # dashboard report the same board-wide truth. Each task is isolated: one
+    # malformed legacy row must not suppress diagnostics for its siblings.
+    try:
+        from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_routes
+
+        active_rows = conn.execute(
+            "SELECT * FROM tasks WHERE status NOT IN ('archived','superseded') "
+            "ORDER BY id"
+        ).fetchall()
+        for row in active_rows:
+            task_id = row["id"]
+            try:
+                if row["spec_fingerprint"]:
+                    actual = kb._compute_spec_fingerprint(
+                        kb._task_spec_from_row(conn, task_id)
+                    )
+                    if actual != row["spec_fingerprint"]:
+                        diagnostics.append(Diagnostic(
+                            kind="spec_fingerprint_drift",
+                            severity="error",
+                            title=f"Task {task_id} specification fingerprint drifted",
+                            detail="A covered field or dependency edge changed outside the canonical mutator.",
+                            data={"task_id": task_id},
+                        ))
+                if row["workflow_template_id"]:
+                    if not row["spec_fingerprint"] or not row["route_fingerprint"]:
+                        diagnostics.append(Diagnostic(
+                            kind="route_task_missing_fingerprint",
+                            severity="critical",
+                            title=f"Typed route {task_id} is missing an integrity fingerprint",
+                            detail="Quarantine this route before dispatch and repair its canonical specification.",
+                            data={"task_id": task_id},
+                        ))
+                    try:
+                        template = kanban_routes.load_template(row["workflow_template_id"])
+                    except Exception:
+                        template = None
+                    if template is None:
+                        diagnostics.append(Diagnostic(
+                            kind="route_template_unresolvable",
+                            severity="error",
+                            title=f"Typed route {task_id} has no resolvable template",
+                            detail=f"Template {row['workflow_template_id']!r} is unavailable or invalid.",
+                            data={"task_id": task_id},
+                        ))
+
+                latest_control = conn.execute(
+                    "SELECT kind, payload FROM task_events WHERE task_id=? "
+                    "AND kind IN ('blocked','unblocked') ORDER BY id DESC LIMIT 1",
+                    (task_id,),
+                ).fetchone()
+                if latest_control and latest_control["kind"] == "blocked":
+                    try:
+                        payload = json.loads(latest_control["payload"] or "{}")
+                    except Exception:
+                        payload = {}
+                    if payload.get("quarantine") is True:
+                        diagnostics.append(Diagnostic(
+                            kind="quarantined_routes_pending",
+                            severity="warning",
+                            title=f"Route {task_id} is quarantined pending operator repair",
+                            detail=str(payload.get("reason") or "route quarantine"),
+                            data={"task_id": task_id},
+                        ))
+
+                latest_audit = conn.execute(
+                    "SELECT id, kind FROM task_events WHERE task_id=? "
+                    "AND kind IN ('route_audit_error','claimed','promoted','unblocked') "
+                    "ORDER BY id DESC LIMIT 1",
+                    (task_id,),
+                ).fetchone()
+                if latest_audit and latest_audit["kind"] == "route_audit_error":
+                    diagnostics.append(Diagnostic(
+                        kind="route_audit_erroring",
+                        severity="error",
+                        title=f"Route auditor is erroring for {task_id}",
+                        detail="Dispatch enforcement is holding this typed route until audit succeeds.",
+                        data={"task_id": task_id},
+                    ))
+
+                latest_conflict = conn.execute(
+                    "SELECT id, kind FROM task_events WHERE task_id=? "
+                    "AND kind IN ('idempotency_spec_mismatch','route_duplicate',"
+                    "'route_repaired','route_superseded') ORDER BY id DESC LIMIT 1",
+                    (task_id,),
+                ).fetchone()
+                if latest_conflict and latest_conflict["kind"] in {
+                    "idempotency_spec_mismatch", "route_duplicate"
+                }:
+                    diagnostics.append(Diagnostic(
+                        kind="route_conflict_unresolved",
+                        severity="warning",
+                        title=f"Route conflict for {task_id} remains unresolved",
+                        detail="Adopt the existing route or use operator supersession; do not mint a variant key.",
+                        data={"task_id": task_id},
+                    ))
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    try:
+        unsafe = conn.execute(
+            "SELECT p.id parent_id, c.id child_id, c.status child_status "
+            "FROM task_links l JOIN tasks p ON p.id=l.parent_id "
+            "JOIN tasks c ON c.id=l.child_id "
+            "WHERE p.status='superseded' "
+            "AND c.status IN ('ready','running','review','done') ORDER BY p.id,c.id"
+        ).fetchall()
+        for row in unsafe:
+            diagnostics.append(Diagnostic(
+                kind="superseded_satisfying_child",
+                severity="critical",
+                title=f"Child {row['child_id']} advanced past superseded parent {row['parent_id']}",
+                detail="Demote the child and atomically repair its dependency route.",
+                data={"parent_id": row["parent_id"], "child_id": row["child_id"]},
+            ))
+    except Exception:
+        pass
+    return diagnostics

@@ -34,6 +34,7 @@ import os
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
+from hermes_cli import kanban_db as kb_types
 from hermes_cli.goals import judge_goal
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get, load_config
@@ -503,6 +504,10 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "current_run_id": task.current_run_id,
         "model_override": task.model_override,
         "provider_override": task.provider_override,
+        "workflow_template_id": task.workflow_template_id,
+        "current_step_key": task.current_step_key,
+        "spec_fingerprint": task.spec_fingerprint,
+        "route_fingerprint": task.route_fingerprint,
         "parents": parents,
         "children": children,
         "parent_count": len(parents),
@@ -549,6 +554,11 @@ def _handle_show(args: dict, **kw) -> str:
                     "current_run_id": t.current_run_id,
                     "model_override": t.model_override,
                     "provider_override": t.provider_override,
+                    "workflow_template_id": t.workflow_template_id,
+                    "current_step_key": t.current_step_key,
+                    "spec_fingerprint": t.spec_fingerprint,
+                    "route_fingerprint": t.route_fingerprint,
+                    "route_meta": t.route_meta,
                 }
 
             def _run_dict(r):
@@ -1397,6 +1407,11 @@ def _handle_create(args: dict, **kw) -> str:
     idempotency_key = args.get("idempotency_key")
     max_runtime_seconds = args.get("max_runtime_seconds")
     initial_status = args.get("initial_status") or "running"
+    workflow_template_id = args.get("workflow_template_id")
+    step_key = args.get("step_key")
+    route_meta = args.get("route_meta")
+    if route_meta is not None and not isinstance(route_meta, dict):
+        return tool_error("route_meta must be an object")
     skills = args.get("skills")
     if isinstance(skills, str):
         # Accept a single skill name as a string for convenience.
@@ -1459,6 +1474,9 @@ def _handle_create(args: dict, **kw) -> str:
                     int(goal_max_turns) if goal_max_turns is not None else None
                 ),
                 initial_status=str(initial_status),
+                workflow_template_id=workflow_template_id,
+                step_key=step_key,
+                route_meta=route_meta,
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
             )
@@ -1474,6 +1492,16 @@ def _handle_create(args: dict, **kw) -> str:
             )
         finally:
             conn.close()
+    except (kb_types.IdempotencySpecMismatch, kb_types.DuplicateRouteError) as e:
+        existing = getattr(e, "existing_task_id", "unknown")
+        diff = sorted(getattr(e, "diff", {}).keys())
+        return tool_error(
+            "route_conflict: "
+            f"existing={existing} diff={','.join(diff) or 'route_identity'}; "
+            "adopt the existing card if correct. If it is wrong, do not mint "
+            "a new key; block your own task with kind='needs_input' and reason "
+            f"'route-conflict: {existing} <one-line diff>' for operator repair."
+        )
     except ValueError as e:
         return tool_error(f"kanban_create: {e}")
     except Exception as e:
@@ -1654,6 +1682,21 @@ def _handle_link(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            scoped_task = os.environ.get("HERMES_KANBAN_TASK")
+            if scoped_task and scoped_task not in {str(parent_id), str(child_id)}:
+                mode = kb._integrity_mode("worker_link_guard")
+                if mode == "enforce":
+                    return tool_error(
+                        "kanban_link: task-scoped workers cannot link two foreign tasks"
+                    )
+                if mode == "report":
+                    with kb.write_txn(conn):
+                        kb._append_event(
+                            conn,
+                            scoped_task,
+                            "foreign_link_attempt",
+                            {"parent_id": str(parent_id), "child_id": str(child_id)},
+                        )
             kb.link_tasks(conn, parent_id=parent_id, child_id=child_id)
             return _ok(parent_id=parent_id, child_id=child_id)
         finally:
@@ -2228,6 +2271,22 @@ KANBAN_CREATE_SCHEMA = {
                     "exists, return that task's id instead of creating "
                     "a duplicate. Useful for retry-safe automation."
                 ),
+            },
+            "workflow_template_id": {
+                "type": "string",
+                "description": "Workflow route-template id for a typed phase card.",
+            },
+            "step_key": {
+                "type": "string",
+                "description": "Opaque step name within workflow_template_id.",
+            },
+            "route_meta": {
+                "type": "object",
+                "description": (
+                    "Structured route identity and immutable handoff fields; "
+                    "required with workflow_template_id and step_key."
+                ),
+                "additionalProperties": True,
             },
             "max_runtime_seconds": {
                 "type": "integer",

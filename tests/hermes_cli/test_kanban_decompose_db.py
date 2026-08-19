@@ -67,6 +67,18 @@ def test_decompose_creates_children_and_promotes_root(kanban_home):
     assert c1.status == "todo"
     assert c1.assignee == "engineer"
 
+    with kb.connect() as conn:
+        for child_id in child_ids:
+            child = kb.get_task(conn, child_id)
+            assert child.spec_fingerprint
+            assert child.spec_fingerprint == kb._compute_spec_fingerprint(
+                kb._task_spec_from_row(conn, child_id)
+            )
+            assert not any(
+                event.kind == "spec_amended"
+                for event in kb.list_events(conn, child_id)
+            )
+
 
 def test_decompose_records_audit_comment_and_event(kanban_home):
     with kb.connect() as conn:

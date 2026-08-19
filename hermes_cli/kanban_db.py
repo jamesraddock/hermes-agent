@@ -99,8 +99,12 @@ _log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+VALID_STATUSES = {
+    "triage", "todo", "scheduled", "ready", "running", "blocked",
+    "review", "done", "archived", "superseded",
+}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
+SATISFYING_PARENT_STATUSES = ("done", "archived")
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -1089,6 +1093,9 @@ class Task:
     current_run_id: Optional[int] = None
     workflow_template_id: Optional[str] = None
     current_step_key: Optional[str] = None
+    spec_fingerprint: Optional[str] = None
+    route_fingerprint: Optional[str] = None
+    route_meta: Optional[str] = None
     # Force-loaded skills for the worker on this task (passed via
     # --skills). Stored as a JSON array of skill names. None = use only
     # the defaults; empty list = explicitly no extra skills.
@@ -1203,6 +1210,13 @@ class Task:
             current_step_key=(
                 row["current_step_key"] if "current_step_key" in keys else None
             ),
+            spec_fingerprint=(
+                row["spec_fingerprint"] if "spec_fingerprint" in keys else None
+            ),
+            route_fingerprint=(
+                row["route_fingerprint"] if "route_fingerprint" in keys else None
+            ),
+            route_meta=(row["route_meta"] if "route_meta" in keys else None),
             skills=skills_value,
             model_override=row["model_override"] if "model_override" in keys and row["model_override"] else None,
             provider_override=(
@@ -1371,6 +1385,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- them; the dispatcher doesn't consult them for routing yet.
     workflow_template_id TEXT,
     current_step_key     TEXT,
+    spec_fingerprint     TEXT,
+    route_fingerprint    TEXT,
+    route_meta           TEXT,
     -- Force-loaded skills for the worker on this task, stored as JSON.
     -- Passed to the worker via `--skills`. NULL or empty array = no extras.
     skills               TEXT,
@@ -2610,6 +2627,16 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "tasks", "current_step_key", "current_step_key TEXT"
         )
+    if "spec_fingerprint" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "spec_fingerprint", "spec_fingerprint TEXT"
+        )
+    if "route_fingerprint" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "route_fingerprint", "route_fingerprint TEXT"
+        )
+    if "route_meta" not in cols:
+        _add_column_if_missing(conn, "tasks", "route_meta", "route_meta TEXT")
     if "skills" not in cols:
         # JSON array of skill names the dispatcher force-loads into the
         # worker via --skills. NULL is fine for existing rows.
@@ -2693,6 +2720,28 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
     )
+    # Fresh empty boards can enforce uniqueness from their first task without
+    # any migration risk. Existing boards enable these indexes explicitly
+    # after a duplicate report/backfill; init must never brick a legacy board.
+    current_task_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(tasks)")
+    }
+    if (
+        conn.execute("SELECT 1 FROM tasks LIMIT 1").fetchone() is None
+        and {"status", "idempotency_key", "route_fingerprint"}.issubset(
+            current_task_columns
+        )
+    ):
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_idem_active "
+            "ON tasks(idempotency_key) WHERE idempotency_key IS NOT NULL "
+            "AND status NOT IN ('archived','superseded')"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_route_active "
+            "ON tasks(route_fingerprint) WHERE route_fingerprint IS NOT NULL "
+            "AND status NOT IN ('archived','superseded')"
+        )
 
     # task_events gained a run_id column; back-fill it as NULL for
     # historical events (they predate runs and can't be attributed).
@@ -3155,6 +3204,240 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+@dataclass(frozen=True)
+class CreateResult:
+    task_id: str
+    created: bool
+    deduped: bool
+    mismatch: Optional[dict] = None
+
+
+class IdempotencySpecMismatch(ValueError):
+    def __init__(self, existing_task_id: str, diff: dict):
+        self.existing_task_id = existing_task_id
+        self.diff = diff
+        super().__init__(
+            f"idempotency specification conflicts with {existing_task_id}: "
+            f"{', '.join(sorted(diff))}"
+        )
+
+
+class DuplicateRouteError(ValueError):
+    def __init__(self, existing_task_id: str):
+        self.existing_task_id = existing_task_id
+        super().__init__(f"route already exists as {existing_task_id}")
+
+
+# Public alias keeps route-validation failures on the kanban_db contract surface.
+from hermes_cli.kanban_routes import RouteValidationError
+
+
+def _integrity_mode(name: str) -> str:
+    """Return a normalized Board Integrity mode without making config fatal."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        value = (
+            (load_config_readonly() or {})
+            .get("kanban", {})
+            .get("integrity", {})
+            .get(name, "report")
+        )
+    except Exception:
+        value = "report"
+    value = str(value or "report").strip().lower()
+    return value if value in {"off", "report", "enforce"} else "report"
+
+
+def _normalize_lf(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(_normalize_lf(text).encode("utf-8")).hexdigest()
+
+
+def _canonical_route_meta(route_meta: Optional[Mapping[str, Any]]) -> tuple[Optional[dict], Optional[str]]:
+    if route_meta is None:
+        return None, None
+    if not isinstance(route_meta, Mapping):
+        raise ValueError("route_meta must be an object")
+    normalized = {str(key): value for key, value in route_meta.items()}
+    return normalized, json.dumps(
+        normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+
+
+def _build_task_spec(
+    *,
+    title: str,
+    body: Optional[str],
+    assignee: Optional[str],
+    skills: Optional[list[str]],
+    parents: Iterable[str],
+    workflow_template_id: Optional[str],
+    step_key: Optional[str],
+    route_meta_text: Optional[str],
+    goal_mode: bool,
+    workspace_kind: str,
+    project_id: Optional[str],
+    tenant: Optional[str],
+) -> dict:
+    return {
+        "v": 1,
+        "title": title.strip(),
+        "body_sha256": _sha256_text(body) if body is not None else None,
+        "assignee": assignee,
+        "skills": skills,
+        "parents": sorted(str(parent) for parent in parents),
+        "workflow_template_id": workflow_template_id,
+        "step_key": step_key,
+        "route_meta_sha256": _sha256_text(route_meta_text) if route_meta_text else None,
+        "goal_mode": bool(goal_mode),
+        "workspace_kind": workspace_kind,
+        "project_id": project_id,
+        "tenant": tenant,
+    }
+
+
+def _compute_spec_fingerprint(spec: Mapping[str, Any]) -> str:
+    canonical = json.dumps(
+        dict(spec), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _task_spec_from_row(conn: sqlite3.Connection, task_id: str) -> dict:
+    task = get_task(conn, task_id)
+    if task is None:
+        raise ValueError(f"task {task_id} not found")
+    return _build_task_spec(
+        title=task.title,
+        body=task.body,
+        assignee=task.assignee,
+        skills=task.skills,
+        parents=parent_ids(conn, task_id),
+        workflow_template_id=task.workflow_template_id,
+        step_key=task.current_step_key,
+        route_meta_text=task.route_meta,
+        goal_mode=task.goal_mode,
+        workspace_kind=task.workspace_kind,
+        project_id=task.project_id,
+        tenant=task.tenant,
+    )
+
+
+def _refresh_spec_fingerprint(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Recompute one persisted fingerprint after an authoritative field edit."""
+    row = conn.execute(
+        "SELECT spec_fingerprint FROM tasks WHERE id=?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return False
+    fingerprint = _compute_spec_fingerprint(_task_spec_from_row(conn, task_id))
+    if row["spec_fingerprint"] == fingerprint:
+        return False
+    conn.execute(
+        "UPDATE tasks SET spec_fingerprint=? WHERE id=?",
+        (fingerprint, task_id),
+    )
+    _append_event(
+        conn, task_id, "spec_amended", {"spec_fingerprint": fingerprint}
+    )
+    return True
+
+
+def _spec_diff(old: Mapping[str, Any], new: Mapping[str, Any]) -> dict:
+    """Return field names and value hashes; never disclose raw task text."""
+    diff: dict[str, dict[str, Optional[str]]] = {}
+    for field_name in sorted(set(old) | set(new)):
+        if old.get(field_name) == new.get(field_name):
+            continue
+        diff[field_name] = {
+            "old_sha256": _sha256_text(json.dumps(old.get(field_name), sort_keys=True, default=str)),
+            "new_sha256": _sha256_text(json.dumps(new.get(field_name), sort_keys=True, default=str)),
+        }
+    return diff
+
+
+def backfill_spec_fingerprints(
+    conn: sqlite3.Connection, *, batch_size: int = 500
+) -> int:
+    """Idempotently fingerprint occupying legacy rows without timeline spam."""
+    task_ids = [
+        row["id"]
+        for row in conn.execute(
+            "SELECT id FROM tasks WHERE spec_fingerprint IS NULL "
+            "AND status NOT IN ('archived','superseded') ORDER BY id"
+        ).fetchall()
+    ]
+    updated = 0
+    for start in range(0, len(task_ids), max(1, int(batch_size))):
+        with write_txn(conn):
+            for task_id in task_ids[start : start + max(1, int(batch_size))]:
+                fingerprint = _compute_spec_fingerprint(
+                    _task_spec_from_row(conn, task_id)
+                )
+                cur = conn.execute(
+                    "UPDATE tasks SET spec_fingerprint=? "
+                    "WHERE id=? AND spec_fingerprint IS NULL",
+                    (fingerprint, task_id),
+                )
+                updated += cur.rowcount
+    return updated
+
+
+def integrity_duplicate_groups(conn: sqlite3.Connection) -> dict[str, list[dict]]:
+    groups: dict[str, list[dict]] = {}
+    for column in ("idempotency_key", "route_fingerprint"):
+        rows = conn.execute(
+            f"SELECT {column} value, count(*) count, group_concat(id) task_ids "
+            "FROM tasks WHERE "
+            f"{column} IS NOT NULL AND status NOT IN ('archived','superseded') "
+            f"GROUP BY {column} HAVING count(*) > 1 ORDER BY {column}"
+        ).fetchall()
+        groups[column] = [
+            {
+                "value_sha256": _sha256_text(str(row["value"])),
+                "count": int(row["count"]),
+                "task_ids": sorted(str(row["task_ids"]).split(",")),
+            }
+            for row in rows
+        ]
+    return groups
+
+
+def enable_integrity_uniqueness(conn: sqlite3.Connection) -> None:
+    with write_txn(conn):
+        duplicates = integrity_duplicate_groups(conn)
+        if any(duplicates.values()):
+            raise ValueError("cannot enable uniqueness while duplicate groups exist")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_idem_active "
+            "ON tasks(idempotency_key) WHERE idempotency_key IS NOT NULL "
+            "AND status NOT IN ('archived','superseded')"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_route_active "
+            "ON tasks(route_fingerprint) WHERE route_fingerprint IS NOT NULL "
+            "AND status NOT IN ('archived','superseded')"
+        )
+
+
+def disable_integrity_uniqueness(conn: sqlite3.Connection) -> None:
+    with write_txn(conn):
+        conn.execute("DROP INDEX IF EXISTS idx_tasks_idem_active")
+        conn.execute("DROP INDEX IF EXISTS idx_tasks_route_active")
+
+
+def create_task_ex(conn: sqlite3.Connection, **kwargs) -> CreateResult:
+    """Structured companion to create_task without breaking its id return."""
+    before = {row["id"] for row in conn.execute("SELECT id FROM tasks").fetchall()}
+    task_id = create_task(conn, **kwargs)
+    created = task_id not in before
+    return CreateResult(task_id=task_id, created=created, deduped=not created)
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -3183,6 +3466,9 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    workflow_template_id: Optional[str] = None,
+    step_key: Optional[str] = None,
+    route_meta: Optional[Mapping[str, Any]] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3393,21 +3679,6 @@ def create_task(
             )
         skills_list = cleaned
 
-    # Idempotency check — return the existing task instead of creating a
-    # duplicate. Done BEFORE entering write_txn to keep the fast path fast
-    # and to avoid holding a write lock during the lookup. Race is
-    # acceptable: two concurrent creators with the same key might both
-    # insert, at which point both rows exist but the next lookup stabilises.
-    if idempotency_key:
-        row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
-            "AND status != 'archived' "
-            "ORDER BY created_at DESC LIMIT 1",
-            (idempotency_key,),
-        ).fetchone()
-        if row:
-            return row["id"]
-
     now = int(time.time())
 
     # Resolve workspace_path from board-level default_workdir when the
@@ -3430,6 +3701,51 @@ def create_task(
         if board_default:
             workspace_path = str(board_default)
 
+    workflow_template_id = str(workflow_template_id or "").strip() or None
+    step_key = str(step_key or "").strip() or None
+    if bool(workflow_template_id) != bool(step_key):
+        raise ValueError("workflow_template_id and step_key must be supplied together")
+    route_meta_obj, route_meta_text = _canonical_route_meta(route_meta)
+    if workflow_template_id and route_meta_obj is None:
+        raise ValueError("route-bearing tasks require route_meta")
+    task_spec = _build_task_spec(
+        title=title,
+        body=body,
+        assignee=assignee,
+        skills=skills_list,
+        parents=parents,
+        workflow_template_id=workflow_template_id,
+        step_key=step_key,
+        route_meta_text=route_meta_text,
+        goal_mode=goal_mode,
+        workspace_kind=workspace_kind,
+        project_id=project_id,
+        tenant=tenant,
+    )
+    spec_fingerprint = _compute_spec_fingerprint(task_spec)
+    route_fingerprint = None
+    route_violations = []
+    if workflow_template_id:
+        from hermes_cli import kanban_routes
+
+        route_violations = kanban_routes.validate_creation(
+            conn,
+            {
+                **task_spec,
+                "route_meta": route_meta_obj,
+                "parents": parents,
+                "worker_task_id": os.environ.get("HERMES_KANBAN_TASK"),
+            },
+        )
+        mode = _integrity_mode("route_validation")
+        if route_violations and mode == "enforce":
+            raise kanban_routes.RouteValidationError(route_violations)
+        template = kanban_routes.load_template(workflow_template_id)
+        if template is not None:
+            route_fingerprint = kanban_routes.compute_route_fingerprint(
+                template, step_key, route_meta_obj or {}
+            )
+
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
         task_id = _new_task_id()
@@ -3438,6 +3754,70 @@ def create_task(
             # compose create_task calls under one outer commit so the
             # dispatcher can never observe a partially constructed graph.
             with write_txn(conn, allow_nested=True):
+                existing = None
+                if idempotency_key:
+                    existing = conn.execute(
+                        "SELECT id, spec_fingerprint FROM tasks "
+                        "WHERE idempotency_key = ? "
+                        "AND status NOT IN ('archived', 'superseded') "
+                        "ORDER BY created_at DESC LIMIT 1",
+                        (idempotency_key,),
+                    ).fetchone()
+                if existing is not None:
+                    existing_spec = _task_spec_from_row(conn, existing["id"])
+                    existing_fp = existing["spec_fingerprint"] or _compute_spec_fingerprint(existing_spec)
+                    if existing_fp == spec_fingerprint:
+                        last = conn.execute(
+                            "SELECT kind, payload FROM task_events WHERE task_id=? "
+                            "ORDER BY id DESC LIMIT 1",
+                            (existing["id"],),
+                        ).fetchone()
+                        duplicate_payload = {"spec_fingerprint": spec_fingerprint}
+                        if not (last and last["kind"] == "task_deduped"):
+                            _append_event(
+                                conn, existing["id"], "task_deduped", duplicate_payload
+                            )
+                        return existing["id"]
+                    diff = _spec_diff(existing_spec, task_spec)
+                    last = conn.execute(
+                        "SELECT kind, payload FROM task_events WHERE task_id=? "
+                        "ORDER BY id DESC LIMIT 1",
+                        (existing["id"],),
+                    ).fetchone()
+                    repeated = False
+                    if last and last["kind"] == "idempotency_spec_mismatch":
+                        try:
+                            prior_payload = json.loads(last["payload"] or "{}")
+                        except (TypeError, json.JSONDecodeError):
+                            prior_payload = {}
+                        repeated = prior_payload.get("spec_fingerprint") == spec_fingerprint
+                    if not repeated:
+                        _append_event(
+                            conn,
+                            existing["id"],
+                            "idempotency_spec_mismatch",
+                            {"spec_fingerprint": spec_fingerprint, "fields": sorted(diff)},
+                        )
+                    if _integrity_mode("strict_idempotency") == "enforce":
+                        raise IdempotencySpecMismatch(existing["id"], diff)
+                    return existing["id"]
+                if route_fingerprint:
+                    route_existing = conn.execute(
+                        "SELECT id FROM tasks WHERE route_fingerprint = ? "
+                        "AND status NOT IN ('archived', 'superseded') "
+                        "ORDER BY created_at DESC LIMIT 1",
+                        (route_fingerprint,),
+                    ).fetchone()
+                    if route_existing is not None:
+                        _append_event(
+                            conn,
+                            route_existing["id"],
+                            "route_duplicate",
+                            {"route_fingerprint": route_fingerprint},
+                        )
+                        if _integrity_mode("strict_idempotency") == "enforce":
+                            raise DuplicateRouteError(route_existing["id"])
+                        return route_existing["id"]
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
@@ -3461,7 +3841,10 @@ def create_task(
                             "(" + ",".join("?" * len(parents)) + ")",
                             parents,
                         ).fetchall()
-                        if any(r["status"] != "done" for r in rows):
+                        if any(
+                            r["status"] not in SATISFYING_PARENT_STATUSES
+                            for r in rows
+                        ):
                             task_status = "todo"
                 # Even in triage mode we still need to validate parent ids
                 # so the eventual link rows don't dangle.
@@ -3497,8 +3880,10 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id,
+                        workflow_template_id, current_step_key,
+                        spec_fingerprint, route_fingerprint, route_meta
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3524,6 +3909,11 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        workflow_template_id,
+                        step_key,
+                        spec_fingerprint,
+                        route_fingerprint,
+                        route_meta_text,
                     ),
                 )
                 for pid in parents:
@@ -3555,6 +3945,21 @@ def create_task(
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
+                if route_violations and _integrity_mode("route_validation") == "report":
+                    missing_parent_steps = sorted({
+                        step
+                        for violation in route_violations
+                        for step in (violation.data or {}).get("missing_parent_steps", [])
+                    })
+                    _append_event(
+                        conn,
+                        task_id,
+                        "route_validation_failed",
+                        {
+                            "violations": [v.to_dict() for v in route_violations],
+                            "missing_parent_steps": missing_parent_steps,
+                        },
+                    )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -3682,8 +4087,8 @@ def list_tasks(
     if current_step_key is not None:
         query += " AND current_step_key = ?"
         params.append(current_step_key)
-    if not include_archived and status != "archived":
-        query += " AND status != 'archived'"
+    if not include_archived and status not in {"archived", "superseded"}:
+        query += " AND status NOT IN ('archived', 'superseded')"
     if order_by is not None:
         order_by = order_by.strip().lower()
         if order_by not in VALID_SORT_ORDERS:
@@ -3728,10 +4133,47 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
             )
         else:
             conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (profile, task_id))
+        _refresh_spec_fingerprint(conn, task_id)
         _append_event(conn, task_id, "assigned", {"assignee": profile})
     # Task-mutation observer (RFC #58548), fired AFTER the assignment txn
     # has committed so subscribers always observe durable board state.
     notify_task_updated(conn, task_id, ("assignee",))
+    return True
+
+
+def update_task_fields(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    title: Optional[str] = None,
+    body: Optional[str] = None,
+) -> bool:
+    """Edit title/body through one fingerprint-maintaining kernel path."""
+    if title is not None and not title.strip():
+        raise ValueError("title cannot be blank")
+    sets: list[str] = []
+    params: list[Any] = []
+    changed: list[str] = []
+    if title is not None:
+        sets.append("title=?")
+        params.append(title.strip())
+        changed.append("title")
+    if body is not None:
+        sets.append("body=?")
+        params.append(body)
+        changed.append("body")
+    if not sets:
+        return get_task(conn, task_id) is not None
+    with write_txn(conn):
+        params.append(task_id)
+        cur = conn.execute(
+            f"UPDATE tasks SET {', '.join(sets)} WHERE id=?", tuple(params)
+        )
+        if cur.rowcount != 1:
+            return False
+        _refresh_spec_fingerprint(conn, task_id)
+        _append_event(conn, task_id, "edited", {"changed_fields": changed})
+    notify_task_updated(conn, task_id, tuple(changed))
     return True
 
 
@@ -3826,6 +4268,46 @@ def set_reasoning_effort(
 # Links
 # ---------------------------------------------------------------------------
 
+def _validate_route_parent_mutation(
+    conn: sqlite3.Connection,
+    child_id: str,
+    proposed_parents: Iterable[str],
+) -> None:
+    child = get_task(conn, child_id)
+    if child is None or not child.workflow_template_id:
+        return
+    mode = _integrity_mode("route_validation")
+    if mode == "off":
+        return
+    from hermes_cli import kanban_routes
+
+    try:
+        route_meta = json.loads(child.route_meta or "{}")
+    except (TypeError, ValueError):
+        route_meta = {}
+    violations = kanban_routes.validate_creation(
+        conn,
+        {
+            "workflow_template_id": child.workflow_template_id,
+            "step_key": child.current_step_key,
+            "route_meta": route_meta,
+            "assignee": child.assignee,
+            "skills": child.skills,
+            "parents": sorted(set(str(parent) for parent in proposed_parents)),
+        },
+    )
+    if not violations:
+        return
+    if mode == "enforce":
+        raise kanban_routes.RouteValidationError(violations)
+    _append_event(
+        conn,
+        child_id,
+        "route_validation_failed",
+        {"violations": [violation.to_dict() for violation in violations]},
+    )
+
+
 def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
@@ -3837,15 +4319,19 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
             raise ValueError(
                 f"linking {parent_id} -> {child_id} would create a cycle"
             )
+        _validate_route_parent_mutation(
+            conn, child_id, [*parent_ids(conn, child_id), parent_id]
+        )
         conn.execute(
             "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
             (parent_id, child_id),
         )
+        _refresh_spec_fingerprint(conn, child_id)
         # If child was ready but parent is not yet done, demote child to todo.
         parent_status = conn.execute(
             "SELECT status FROM tasks WHERE id = ?", (parent_id,)
         ).fetchone()["status"]
-        if parent_status != "done":
+        if parent_status not in SATISFYING_PARENT_STATUSES:
             conn.execute(
                 "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
                 (child_id,),
@@ -3882,11 +4368,19 @@ def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
 
 def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
     with write_txn(conn):
+        current_parents = parent_ids(conn, child_id)
+        if parent_id in current_parents:
+            _validate_route_parent_mutation(
+                conn,
+                child_id,
+                [value for value in current_parents if value != parent_id],
+            )
         cur = conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
             (parent_id, child_id),
         )
         if cur.rowcount:
+            _refresh_spec_fingerprint(conn, child_id)
             _append_event(
                 conn, child_id, "unlinked",
                 {"parent": parent_id, "child": child_id},
@@ -4562,7 +5056,7 @@ def recompute_ready(
                 "WHERE l.child_id = ?",
                 (task_id,),
             ).fetchall()
-            if all(p["status"] in ("done", "archived") for p in parents):
+            if all(p["status"] in SATISFYING_PARENT_STATUSES for p in parents):
                 resume_status = _resume_status_from_events(conn, task_id)
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
@@ -6617,6 +7111,7 @@ def request_review(
                 "task is not in running/ready (or expected_run_id did not "
                 "match the current run)",
             )
+        _refresh_spec_fingerprint(conn, task_id)
         run_id = _end_run(
             conn,
             task_id,
@@ -6809,7 +7304,7 @@ def promote_task(
         ).fetchall()
         unsatisfied = [
             p["id"] for p in parents
-            if p["status"] not in ("done", "archived")
+            if p["status"] not in SATISFYING_PARENT_STATUSES
         ]
         if unsatisfied:
             return False, (
@@ -7004,6 +7499,7 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         if cur.rowcount != 1:
             return False
+        _refresh_spec_fingerprint(conn, task_id)
         payload: dict[str, Any] = {"status": new_status}
         if implementer:
             payload["implementer"] = implementer
@@ -7244,6 +7740,7 @@ def specify_triage_task(
         )
         if cur.rowcount != 1:
             return False
+        _refresh_spec_fingerprint(conn, task_id)
         if changed_fields and author and author.strip():
             # Inline INSERT (rather than ``add_comment``) because we're
             # already inside this function's write_txn — nested BEGIN
@@ -7314,6 +7811,18 @@ def decompose_triage_task(
     """
     if not children:
         return None
+    root_route = get_task(conn, task_id)
+    if root_route is not None and root_route.workflow_template_id:
+        violations = _audit_route_before_dispatch(conn, task_id)
+        if violations:
+            _record_route_audit_event(
+                conn,
+                task_id,
+                "route_validation_failed",
+                {"violations": violations, "surface": "decompose"},
+            )
+            if _integrity_mode("route_validation") == "enforce":
+                return None
     if root_assignee is not None:
         root_assignee = _canonical_assignee(root_assignee)
 
@@ -7455,6 +7964,18 @@ def decompose_triage_task(
                     {"parent": parent_id, "child": child_id},
                 )
 
+        # These children bypass create_task() so finalize their canonical
+        # fingerprints only after the complete sibling graph exists. This is
+        # creation-time state, not an amendment, so do not emit spec_amended.
+        for child_id in child_ids:
+            conn.execute(
+                "UPDATE tasks SET spec_fingerprint=? WHERE id=?",
+                (
+                    _compute_spec_fingerprint(_task_spec_from_row(conn, child_id)),
+                    child_id,
+                ),
+            )
+
         # Link the ROOT task as a child of every leaf child — i.e. the
         # root waits for the whole graph. Simpler than computing leaves:
         # link root under every child. Cycle-free because the root is
@@ -7477,6 +7998,7 @@ def decompose_triage_task(
             f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?",
             tuple(params),
         )
+        _refresh_spec_fingerprint(conn, task_id)
 
         # Audit comment + event on the root so the timeline shows the fan-out.
         if author and author.strip():
@@ -7510,12 +8032,182 @@ def decompose_triage_task(
     return child_ids
 
 
+# ---------------------------------------------------------------------------
+# Board Integrity quarantine / canonical route repair
+# ---------------------------------------------------------------------------
+
+
+def quarantine_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+    actor: str,
+) -> bool:
+    """Park a malformed route in a sticky, operator-owned blocked state."""
+    source_statuses = {"triage", "todo", "ready", "scheduled", "blocked"}
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None or row["status"] not in source_statuses:
+            return False
+        conn.execute(
+            "UPDATE tasks SET status='blocked', block_kind='needs_input', "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL WHERE id=?",
+            (task_id,),
+        )
+        _end_run(
+            conn,
+            task_id,
+            outcome="reclaimed",
+            status="reclaimed",
+            summary="route quarantined by operator",
+        )
+        _append_event(
+            conn,
+            task_id,
+            "blocked",
+            {
+                "reason": f"route-quarantine: {reason}",
+                "actor": actor,
+                "quarantine": True,
+                "kind": "needs_input",
+            },
+        )
+    return True
+
+
+@dataclass(frozen=True)
+class RouteRepairResult:
+    winner_id: str
+    superseded: list[str]
+    relinked: dict[str, list[str]]
+
+
+def supersede_route(
+    conn: sqlite3.Connection,
+    *,
+    loser_ids: list[str],
+    winner_id: Optional[str] = None,
+    replacement_spec: Optional[dict] = None,
+    actor: str,
+    reason: str,
+) -> RouteRepairResult:
+    """Atomically retire malformed routes and re-parent their children."""
+    losers = list(dict.fromkeys(str(task_id) for task_id in loser_ids if task_id))
+    if not losers:
+        raise ValueError("at least one loser task is required")
+    if bool(winner_id) == bool(replacement_spec):
+        raise ValueError("provide exactly one of winner_id or replacement_spec")
+    allowed = {"triage", "todo", "ready", "blocked", "scheduled"}
+    relinked: dict[str, list[str]] = {}
+    with write_txn(conn):
+        placeholders = ",".join("?" for _ in losers)
+        rows = conn.execute(
+            f"SELECT id, status, claim_lock, current_run_id FROM tasks "
+            f"WHERE id IN ({placeholders})",
+            tuple(losers),
+        ).fetchall()
+        by_id = {row["id"]: row for row in rows}
+        missing = [task_id for task_id in losers if task_id not in by_id]
+        if missing:
+            raise ValueError(f"loser_not_found: {', '.join(missing)}")
+        for task_id, row in by_id.items():
+            if row["status"] not in allowed:
+                raise ValueError(f"loser_terminal: {task_id} is {row['status']}")
+            if row["claim_lock"] or row["current_run_id"]:
+                raise ValueError(f"loser_claimed: {task_id}")
+            authority = conn.execute(
+                "SELECT c.id, c.status FROM task_links l "
+                "JOIN tasks c ON c.id=l.child_id WHERE l.parent_id=? "
+                "AND c.status IN ('done','running','review') LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if authority is not None:
+                raise ValueError(
+                    f"loser_has_downstream_authority: {task_id} -> {authority['id']}"
+                )
+
+        for task_id in losers:
+            conn.execute(
+                "UPDATE tasks SET status='superseded', claim_lock=NULL, "
+                "claim_expires=NULL, worker_pid=NULL WHERE id=?",
+                (task_id,),
+            )
+            _append_event(
+                conn,
+                task_id,
+                "route_superseded",
+                {"actor": actor, "reason": reason},
+            )
+
+        if replacement_spec is not None:
+            winner_id = create_task(conn, **replacement_spec)
+        winner = get_task(conn, str(winner_id))
+        if winner is None or winner.status in {"archived", "superseded"}:
+            raise ValueError("winner_invalid")
+        if winner.workflow_template_id:
+            from hermes_cli import kanban_routes
+
+            violations = kanban_routes.validate_creation(
+                conn,
+                {
+                    **_task_spec_from_row(conn, winner.id),
+                    "route_meta": json.loads(winner.route_meta or "{}"),
+                    "parents": parent_ids(conn, winner.id),
+                },
+            )
+            if violations:
+                raise kanban_routes.RouteValidationError(violations)
+
+        changed_children: set[str] = set()
+        for loser_id in losers:
+            children = child_ids(conn, loser_id)
+            relinked[loser_id] = children
+            for child_id in children:
+                changed_children.add(child_id)
+                if _would_cycle(conn, winner.id, child_id):
+                    raise ValueError(f"cycle_detected: {winner.id} -> {child_id}")
+                conn.execute(
+                    "DELETE FROM task_links WHERE parent_id=? AND child_id=?",
+                    (loser_id, child_id),
+                )
+                conn.execute(
+                    "INSERT OR IGNORE INTO task_links(parent_id, child_id) VALUES (?, ?)",
+                    (winner.id, child_id),
+                )
+                _refresh_spec_fingerprint(conn, child_id)
+                if winner.status not in SATISFYING_PARENT_STATUSES:
+                    conn.execute(
+                        "UPDATE tasks SET status='todo' WHERE id=? AND status='ready'",
+                        (child_id,),
+                    )
+        for child_id in sorted(changed_children):
+            _validate_route_parent_mutation(
+                conn, child_id, parent_ids(conn, child_id)
+            )
+        _append_event(
+            conn,
+            winner.id,
+            "route_repaired",
+            {
+                "actor": actor,
+                "reason": reason,
+                "superseded": losers,
+                "relinked": relinked,
+            },
+        )
+    recompute_ready(conn)
+    return RouteRepairResult(str(winner_id), losers, relinked)
+
+
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
-            "WHERE id = ? AND status != 'archived'",
+            "WHERE id = ? AND status NOT IN ('archived', 'superseded')",
             (task_id,),
         )
         if cur.rowcount != 1:
@@ -7540,23 +8232,26 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
 
 
 def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Permanently remove an already-archived task and its related rows.
+    """Permanently remove an archived/superseded task and related rows.
 
-    Safety guard: only archived tasks can be deleted. Active / blocked / done
-    tasks must be explicitly archived first so accidental data loss requires a
-    second deliberate action.
+    Safety guard: only archived or superseded tasks can be deleted. Active,
+    blocked, and done tasks require a separate deliberate terminal transition
+    first, so accidental data loss still takes two actions.
     """
     with write_txn(conn):
         row = conn.execute(
             "SELECT status FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
-        if not row or row["status"] != "archived":
+        if not row or row["status"] not in {"archived", "superseded"}:
             return False
+        affected_children = child_ids(conn, task_id)
         conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? OR child_id = ?",
             (task_id, task_id),
         )
+        for child_id in affected_children:
+            _refresh_spec_fingerprint(conn, child_id)
         conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
@@ -7576,10 +8271,13 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     if the task was not found.
     """
     with write_txn(conn):
+        affected_children = child_ids(conn, task_id)
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False
         conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
+        for child_id in affected_children:
+            _refresh_spec_fingerprint(conn, child_id)
         conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
@@ -8069,6 +8767,9 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    route_audited: list[tuple[str, str]] = field(default_factory=list)
+    """Route-bearing tasks inspected by Board Integrity this tick as
+    ``(task_id, outcome)`` pairs (report, skipped, quarantined, error)."""
     skipped_locked: bool = False
     """True when this tick was skipped because another process already held
     the board's dispatch lock (issue #35240). A losing dispatcher does no
@@ -9537,6 +10238,88 @@ def check_respawn_guard(
     return None
 
 
+def _audit_route_before_dispatch(
+    conn: sqlite3.Connection, task_id: str
+) -> list[dict[str, Any]]:
+    """Re-validate a route-bearing task immediately before claim."""
+    task = get_task(conn, task_id)
+    if task is None or not task.workflow_template_id:
+        return []
+    from hermes_cli import kanban_routes
+
+    route_meta = json.loads(task.route_meta or "{}")
+    violations = kanban_routes.validate_creation(
+        conn,
+        {
+            **_task_spec_from_row(conn, task_id),
+            "route_meta": route_meta,
+            "parents": parent_ids(conn, task_id),
+        },
+    )
+    template = kanban_routes.load_template(task.workflow_template_id)
+    if template is not None:
+        for parent_id in parent_ids(conn, task_id):
+            parent = get_task(conn, parent_id)
+            if (
+                parent is None
+                or parent.workflow_template_id != task.workflow_template_id
+                or not parent.current_step_key
+            ):
+                continue
+            parent_step = template.get("steps", {}).get(parent.current_step_key) or {}
+            gate = parent_step.get("gate") if isinstance(parent_step, dict) else None
+            if not isinstance(gate, dict) or gate.get("human") is True:
+                continue
+            completers = set(gate.get("completers") or [])
+            if not completers:
+                continue
+            run = conn.execute(
+                "SELECT profile FROM task_runs WHERE task_id=? "
+                "AND outcome='completed' ORDER BY id DESC LIMIT 1",
+                (parent_id,),
+            ).fetchone()
+            if run is None or run["profile"] not in completers:
+                violations.append(
+                    kanban_routes.RouteViolation(
+                        "route_gate_provenance_invalid",
+                        f"parent gate {parent_id} lacks an authorized completing run",
+                        "parents",
+                        {"parent_id": parent_id},
+                    )
+                )
+    actual_spec = _compute_spec_fingerprint(_task_spec_from_row(conn, task_id))
+    if not task.spec_fingerprint or task.spec_fingerprint != actual_spec:
+        violations.append(
+            kanban_routes.RouteViolation(
+                "spec_fingerprint_drift", "stored task specification fingerprint drifted"
+            )
+        )
+    if not task.route_fingerprint:
+        violations.append(
+            kanban_routes.RouteViolation(
+                "route_fingerprint_missing", "route-bearing task has no route fingerprint"
+            )
+        )
+    elif conn.execute(
+        "SELECT count(*) FROM tasks WHERE route_fingerprint=? "
+        "AND status NOT IN ('archived','superseded')",
+        (task.route_fingerprint,),
+    ).fetchone()[0] != 1:
+        violations.append(
+            kanban_routes.RouteViolation(
+                "route_fingerprint_duplicate", "route fingerprint is not unique"
+            )
+        )
+    return [violation.to_dict() for violation in violations]
+
+
+def _record_route_audit_event(
+    conn: sqlite3.Connection, task_id: str, kind: str, payload: dict
+) -> None:
+    with write_txn(conn):
+        _append_event(conn, task_id, kind, payload)
+
+
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     """Return True iff there is at least one ready+assigned+unclaimed task
     whose assignee maps to a real Hermes profile.
@@ -10138,6 +10921,7 @@ def _dispatch_once_locked(
                                 "AND (assignee IS NULL OR assignee = '')",
                                 (_default_assignee, row["id"]),
                             )
+                            _refresh_spec_fingerprint(conn, row["id"])
                             _append_event(
                                 conn, row["id"], "assigned",
                                 {
@@ -10215,6 +10999,50 @@ def _dispatch_once_locked(
                         {"reason": guard_reason},
                     )
             continue
+        audit_mode = _integrity_mode("dispatch_audit")
+        if audit_mode != "off":
+            try:
+                route_violations = _audit_route_before_dispatch(conn, row["id"])
+            except Exception as exc:
+                if not dry_run:
+                    _record_route_audit_event(
+                        conn, row["id"], "route_audit_error",
+                        {"error_type": type(exc).__name__},
+                    )
+                result.route_audited.append((row["id"], "error"))
+                if audit_mode == "enforce":
+                    continue
+                route_violations = []
+            if route_violations:
+                prior = conn.execute(
+                    "SELECT id FROM task_events WHERE task_id=? "
+                    "AND kind='route_audit_failed' ORDER BY id DESC LIMIT 1",
+                    (row["id"],),
+                ).fetchone()
+                cleared = None
+                if prior is not None:
+                    cleared = conn.execute(
+                        "SELECT 1 FROM task_events WHERE task_id=? AND id>? "
+                        "AND kind IN ('promoted','unblocked','claimed') LIMIT 1",
+                        (row["id"], prior["id"]),
+                    ).fetchone()
+                if not dry_run:
+                    _record_route_audit_event(
+                        conn, row["id"], "route_audit_failed",
+                        {"violations": route_violations},
+                    )
+                if audit_mode == "enforce":
+                    if prior is not None and cleared is None and not dry_run:
+                        quarantine_task(
+                            conn, row["id"],
+                            reason="pre-dispatch route validation failed repeatedly",
+                            actor="dispatcher",
+                        )
+                        result.route_audited.append((row["id"], "quarantined"))
+                    else:
+                        result.route_audited.append((row["id"], "skipped"))
+                    continue
+                result.route_audited.append((row["id"], "report"))
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
             spawned += 1

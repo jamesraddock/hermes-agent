@@ -72,13 +72,55 @@ def test_board_empty(client):
     data = r.json()
     # All canonical columns present (triage + the rest), each empty.
     names = [c["name"] for c in data["columns"]]
-    assert set(names) == kb.VALID_STATUSES - {"archived"}
+    assert set(names) == kb.VALID_STATUSES - {"archived", "superseded"}
     for expected in ("triage", "todo", "scheduled", "ready", "running", "blocked", "done"):
         assert expected in names, f"missing column {expected}: {names}"
     assert all(len(c["tasks"]) == 0 for c in data["columns"])
     assert data["tenants"] == []
     assert data["assignees"] == []
     assert data["latest_event_id"] == 0
+
+
+def test_dashboard_cannot_reactivate_superseded_route(client):
+    task = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "superseded", "assignee": "ops"}
+    ).json()["task"]
+    import plugins.kanban.dashboard.plugin_api as api
+
+    conn = api._conn()
+    try:
+        conn.execute("UPDATE tasks SET status='superseded' WHERE id=?", (task["id"],))
+        conn.commit()
+    finally:
+        conn.close()
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}", json={"status": "ready"}
+    )
+    assert response.status_code == 409
+    assert "immutable" in response.json()["detail"]
+
+
+def test_dashboard_unarchive_collision_returns_409(client):
+    first = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "first", "assignee": "ops", "idempotency_key": "same"},
+    ).json()["task"]
+    assert client.patch(
+        f"/api/plugins/kanban/tasks/{first['id']}", json={"status": "archived"}
+    ).status_code == 200
+    second = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "second", "assignee": "ops", "idempotency_key": "same"},
+    )
+    assert second.status_code == 200
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{first['id']}", json={"status": "ready"}
+    )
+
+    assert response.status_code == 409
+    assert "idempotency key" in response.json()["detail"]
 
 
 # ---------------------------------------------------------------------------

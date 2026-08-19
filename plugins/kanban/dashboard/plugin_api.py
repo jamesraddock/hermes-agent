@@ -606,6 +606,9 @@ class CreateTaskBody(BaseModel):
     parents: list[str] = Field(default_factory=list)
     triage: bool = False
     idempotency_key: Optional[str] = None
+    workflow_template_id: Optional[str] = None
+    step_key: Optional[str] = None
+    route_meta: Optional[dict[str, Any]] = None
     max_runtime_seconds: Optional[int] = None
     skills: Optional[list[str]] = None
     goal_mode: bool = False
@@ -646,6 +649,9 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             provider_override=payload.provider_override,
             reasoning_effort=payload.reasoning_effort,
             project_id=payload.project_id,
+            workflow_template_id=payload.workflow_template_id,
+            step_key=payload.step_key,
+            route_meta=payload.route_meta,
             board=board,
         )
         task = kanban_db.get_task(conn, task_id)
@@ -895,6 +901,11 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         # --- status -------------------------------------------------------
         if payload.status is not None:
             s = payload.status
+            if task.status == "superseded":
+                raise HTTPException(
+                    status_code=409,
+                    detail="A superseded route is immutable; use operator repair/delete controls",
+                )
             ok = True
             if s == "done":
                 ok = kanban_db.complete_task(
@@ -946,6 +957,11 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 current = kanban_db.get_task(conn, task_id) if s == "todo" else None
                 reopened = _reopen_if_review(conn, task_id, current)
                 ok = reopened if reopened is not None else _set_status_direct(conn, task_id, s)
+            elif s == "superseded":
+                raise HTTPException(
+                    status_code=400,
+                    detail="Cannot set status to 'superseded' directly; use the operator route-repair CLI",
+                )
             else:
                 raise HTTPException(status_code=400, detail=f"unknown status: {s}")
             if not ok:
@@ -1022,32 +1038,14 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
 
         # --- title / body -------------------------------------------------
         if payload.title is not None or payload.body is not None:
-            with kanban_db.write_txn(conn):
-                sets, vals = [], []
-                if payload.title is not None:
-                    if not payload.title.strip():
-                        raise HTTPException(status_code=400, detail="title cannot be empty")
-                    sets.append("title = ?")
-                    vals.append(payload.title.strip())
-                if payload.body is not None:
-                    sets.append("body = ?")
-                    vals.append(payload.body)
-                vals.append(task_id)
-                conn.execute(
-                    f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", vals,
+            try:
+                ok = kanban_db.update_task_fields(
+                    conn, task_id, title=payload.title, body=payload.body
                 )
-                conn.execute(
-                    "INSERT INTO task_events (task_id, kind, payload, created_at) "
-                    "VALUES (?, 'edited', NULL, ?)",
-                    (task_id, int(time.time())),
-                )
-            # Mutation-boundary observer (RFC #58548), post-commit. Field
-            # names only — values never leave the DB via this payload.
-            kanban_db.notify_task_updated(
-                conn, task_id,
-                [f for f in ("title", "body") if getattr(payload, f) is not None],
-                board=board,
-            )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+            if not ok:
+                raise HTTPException(status_code=404, detail="task not found")
 
         updated = kanban_db.get_task(conn, task_id)
         return {"task": _task_dict(updated) if updated else None}
@@ -1117,7 +1115,7 @@ def _invalidate_descendants_for_parent_reopen(
     terminations.extend(result["terminations"])
 
 
-def _set_status_direct(
+def _set_status_direct_impl(
     conn: sqlite3.Connection, task_id: str, new_status: str,
 ) -> bool:
     """Direct status write for drag-drop moves that aren't covered by the
@@ -1140,6 +1138,8 @@ def _set_status_direct(
             (task_id,),
         ).fetchone()
         if prev is None:
+            return False
+        if prev["status"] == "superseded":
             return False
 
         if prev["status"] == "running" and new_status == "ready":
@@ -1225,6 +1225,21 @@ def _set_status_direct(
     if effective_status in {"done", "ready", "review"}:
         kanban_db.recompute_ready(conn)
     return True
+
+
+def _set_status_direct(
+    conn: sqlite3.Connection, task_id: str, new_status: str,
+) -> bool:
+    try:
+        return _set_status_direct_impl(conn, task_id, new_status)
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Status transition conflicts with an active idempotency key "
+                "or typed route; archive/supersede the competing card first"
+            ),
+        ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -1482,6 +1497,9 @@ def list_diagnostics(
     conn = _conn(board=board)
     try:
         diags_by_task = _compute_task_diagnostics(conn, task_ids=None)
+        board_diags = [d.to_dict() for d in kd.compute_board_diagnostics(conn)]
+        if board_diags:
+            diags_by_task["__board__"] = board_diags
         if not diags_by_task:
             return {"diagnostics": [], "count": 0}
 

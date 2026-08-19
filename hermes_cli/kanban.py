@@ -81,6 +81,9 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
+        "spec_fingerprint": t.spec_fingerprint,
+        "route_fingerprint": t.route_fingerprint,
+        "route_meta": t.route_meta,
     }
 
 
@@ -349,6 +352,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("--idempotency-key", default=None,
                           help="Dedup key. If a non-archived task with this key exists, "
                                "its id is returned instead of creating a duplicate.")
+    p_create.add_argument("--workflow-template", default=None,
+                          dest="workflow_template_id",
+                          help="Workflow route-template id for a typed phase card")
+    p_create.add_argument("--step-key", default=None,
+                          help="Opaque step key within --workflow-template")
+    p_create.add_argument("--route-meta", default=None,
+                          help="Structured route metadata as a JSON object")
     p_create.add_argument("--max-runtime", default=None,
                           help="Per-task runtime cap. Accepts seconds (300) or "
                                "durations (90s, 30m, 2h, 1d). When exceeded, "
@@ -536,6 +546,27 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         default=None,
         help="Only show diagnostics at or above this severity",
     )
+
+    p_integrity = sub.add_parser(
+        "integrity", help="Report, backfill, quarantine, or enforce board integrity"
+    )
+    integrity_sub = p_integrity.add_subparsers(dest="integrity_action", required=True)
+    integrity_sub.add_parser("report")
+    p_backfill = integrity_sub.add_parser("backfill")
+    p_backfill.add_argument("--batch-size", type=int, default=500)
+    p_quarantine = integrity_sub.add_parser("quarantine")
+    p_quarantine.add_argument("task_id")
+    p_quarantine.add_argument("--reason", required=True)
+    integrity_sub.add_parser("enable-uniqueness")
+    integrity_sub.add_parser("disable-uniqueness")
+
+    p_route = sub.add_parser("route", help="Repair typed workflow routes")
+    route_sub = p_route.add_subparsers(dest="route_action", required=True)
+    p_supersede = route_sub.add_parser("supersede")
+    p_supersede.add_argument("--loser", action="append", required=True)
+    p_supersede.add_argument("--winner")
+    p_supersede.add_argument("--replacement-spec")
+    p_supersede.add_argument("--reason", required=True)
     p_diag.add_argument(
         "--task",
         default=None,
@@ -1118,6 +1149,8 @@ def kanban_command(args: argparse.Namespace) -> int:
             "reassign": _cmd_reassign,
             "diagnostics": _cmd_diagnostics,
             "diag":     _cmd_diagnostics,
+            "integrity": _cmd_integrity,
+            "route":    _cmd_route,
             "link":     _cmd_link,
             "unlink":   _cmd_unlink,
             "claim":    _cmd_claim,
@@ -1562,6 +1595,16 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    route_meta = None
+    if getattr(args, "route_meta", None):
+        try:
+            route_meta = json.loads(args.route_meta)
+        except json.JSONDecodeError as exc:
+            print(f"kanban: --route-meta must be a JSON object: {exc}", file=sys.stderr)
+            return 2
+        if not isinstance(route_meta, dict):
+            print("kanban: --route-meta must be a JSON object", file=sys.stderr)
+            return 2
     with kb.connect_closing() as conn:
         task_id = kb.create_task(
             conn,
@@ -1586,6 +1629,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+            workflow_template_id=getattr(args, "workflow_template_id", None),
+            step_key=getattr(args, "step_key", None),
+            route_meta=route_meta,
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -1932,6 +1978,62 @@ def _cmd_reassign(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_integrity(args: argparse.Namespace) -> int:
+    action = args.integrity_action
+    with kb.connect_closing() as conn:
+        if action == "report":
+            from hermes_cli import kanban_diagnostics as kd
+            diagnostics = kd.compute_board_diagnostics(conn)
+            print(json.dumps([d.to_dict() for d in diagnostics], indent=2))
+            return 1 if any(d.severity == "critical" for d in diagnostics) else 0
+        if action == "backfill":
+            count = kb.backfill_spec_fingerprints(conn, batch_size=args.batch_size)
+            print(json.dumps({"backfilled": count}))
+            return 0
+        if action == "quarantine":
+            ok = kb.quarantine_task(
+                conn, args.task_id, reason=args.reason, actor=_profile_author()
+            )
+            print(json.dumps({"task_id": args.task_id, "quarantined": ok}))
+            return 0 if ok else 1
+        if action == "enable-uniqueness":
+            kb.enable_integrity_uniqueness(conn)
+            print("Board Integrity uniqueness indexes enabled")
+            return 0
+        if action == "disable-uniqueness":
+            kb.disable_integrity_uniqueness(conn)
+            print("Board Integrity uniqueness indexes disabled")
+            return 0
+    return 2
+
+
+def _cmd_route(args: argparse.Namespace) -> int:
+    if args.route_action != "supersede":
+        return 2
+    replacement = None
+    if args.replacement_spec:
+        try:
+            replacement = json.loads(Path(args.replacement_spec).read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"kanban route: invalid replacement spec: {exc}", file=sys.stderr)
+            return 2
+    with kb.connect_closing() as conn:
+        result = kb.supersede_route(
+            conn,
+            loser_ids=args.loser,
+            winner_id=args.winner,
+            replacement_spec=replacement,
+            actor=_profile_author(),
+            reason=args.reason,
+        )
+    print(json.dumps({
+        "winner_id": result.winner_id,
+        "superseded": result.superseded,
+        "relinked": result.relinked,
+    }, indent=2))
+    return 0
+
+
 def _cmd_diagnostics(args: argparse.Namespace) -> int:
     """List active diagnostics on the board. Wraps the same rule engine
     the dashboard uses, so CLI output matches what the UI shows.
@@ -1992,6 +2094,9 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                     )
                     if dl:
                         diags_by_task[tid] = dl
+            board_diags = kd.compute_board_diagnostics(conn, config=diag_config)
+            if board_diags:
+                diags_by_task["__board__"] = board_diags
 
         # Severity filter.
         sev = getattr(args, "severity", None)
