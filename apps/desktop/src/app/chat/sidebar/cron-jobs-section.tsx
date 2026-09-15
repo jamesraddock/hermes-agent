@@ -53,6 +53,10 @@ function nextRunMs(job: CronJob): null | number {
   return Number.isNaN(ms) ? null : ms
 }
 
+export function sortCronJobsByName(jobs: readonly CronJob[]): CronJob[] {
+  return [...jobs].sort((a, b) => jobTitle(a).localeCompare(jobTitle(b)) || a.id.localeCompare(b.id))
+}
+
 // Runs all belong to the same job, so the run name just repeats the job name —
 // the timestamp is what tells them apart. Compact (no year, no seconds) for the
 // narrow sidebar.
@@ -149,28 +153,7 @@ export function SidebarCronJobsSection({
     return () => window.clearInterval(id)
   }, [open, visible])
 
-  // Upcoming first (soonest next run), jobs with no next run sink to the bottom,
-  // then alphabetical for stability.
-  const sorted = useMemo(() => {
-    return [...jobs].sort((a, b) => {
-      const an = nextRunMs(a)
-      const bn = nextRunMs(b)
-
-      if (an !== null && bn !== null && an !== bn) {
-        return an - bn
-      }
-
-      if (an === null && bn !== null) {
-        return 1
-      }
-
-      if (an !== null && bn === null) {
-        return -1
-      }
-
-      return jobTitle(a).localeCompare(jobTitle(b))
-    })
-  }, [jobs])
+  const sorted = useMemo(() => sortCronJobsByName(jobs), [jobs])
 
   const cap = Math.min(visibleCount, max)
   const shown = sorted.slice(0, cap)
