@@ -203,6 +203,85 @@ def test_codex_usage_retries_401_with_forced_refresh(monkeypatch, codex_usage_pa
     assert request_calls == ["Bearer revoked-token", "Bearer fresh-token"]
 
 
+def test_anthropic_usage_includes_model_scoped_fable_limit(monkeypatch):
+    calls = []
+    payload = {
+        "five_hour": {
+            "utilization": 45,
+            "resets_at": "2026-07-25T03:00:00Z",
+        },
+        "seven_day": {
+            "utilization": 67,
+            "resets_at": "2026-07-28T13:00:00Z",
+        },
+        "limits": [
+            {
+                "kind": "weekly_scoped",
+                "scope": {
+                    "model": {
+                        "id": "claude-fable-5",
+                        "display_name": "Fable",
+                    }
+                },
+                "percent": 82.5,
+                "resets_at": "2026-07-28T12:59:59Z",
+            }
+        ],
+    }
+    monkeypatch.setattr(account_usage, "resolve_anthropic_token", lambda: "cc-oauth-token")
+    monkeypatch.setattr(
+        account_usage.httpx,
+        "Client",
+        lambda timeout: _FakeClient(calls, payload),
+    )
+
+    snapshot = account_usage.fetch_account_usage("anthropic")
+
+    assert snapshot is not None
+    assert [window.label for window in snapshot.windows] == [
+        "Current session",
+        "Current week",
+        "Fable 5 week",
+    ]
+    fable = snapshot.windows[-1]
+    assert fable.used_percent == 82.5
+    assert fable.detail == "Model-scoped allowance for Fable"
+    assert calls[0]["url"] == "https://api.anthropic.com/api/oauth/usage"
+    rendered = "\n".join(account_usage.render_account_usage_lines(snapshot))
+    assert "Fable 5 week: 18% remaining (82% used)" in rendered
+
+
+def test_anthropic_usage_deduplicates_direct_and_scoped_fable_limits(monkeypatch):
+    calls = []
+    payload = {
+        "seven_day_overage_included": {
+            "utilization": 73,
+            "resets_at": "2026-07-28T13:00:00Z",
+        },
+        "limits": [
+            {
+                "kind": "weekly_scoped",
+                "scope": {"model": {"display_name": "Claude Fable 5"}},
+                "percent": 74,
+                "resets_at": "2026-07-28T13:00:00Z",
+            }
+        ],
+    }
+    monkeypatch.setattr(account_usage, "resolve_anthropic_token", lambda: "cc-oauth-token")
+    monkeypatch.setattr(
+        account_usage.httpx,
+        "Client",
+        lambda timeout: _FakeClient(calls, payload),
+    )
+
+    snapshot = account_usage.fetch_account_usage("anthropic")
+
+    assert snapshot is not None
+    fable_windows = [window for window in snapshot.windows if window.label == "Fable 5 week"]
+    assert len(fable_windows) == 1
+    assert fable_windows[0].used_percent == 73
+
+
 # ── Banked rate-limit reset credits (`/usage reset`) ─────────────────────────
 
 

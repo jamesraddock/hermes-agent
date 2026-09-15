@@ -552,8 +552,33 @@ def _fetch_anthropic_account_usage(
     payload = _get_json("https://api.anthropic.com/api/oauth/usage", headers, timeout=15.0)
     windows = _usage_windows(
         payload, (("five_hour", "Current session"), ("seven_day", "Current week"), ("seven_day_opus", "Opus week"),
-                  ("seven_day_sonnet", "Sonnet week")), "utilization", "resets_at", fraction=True,
+                  ("seven_day_sonnet", "Sonnet week"), ("seven_day_overage_included", "Fable 5 week")),
+        "utilization", "resets_at", fraction=True,
     )
+
+    # Newer Claude OAuth responses expose model-specific allowances as generic
+    # weekly-scoped limits instead of adding another top-level key.
+    scoped_limits = payload.get("limits")
+    if isinstance(scoped_limits, list) and not any(window.label == "Fable 5 week" for window in windows):
+        for item in scoped_limits:
+            if not isinstance(item, dict) or item.get("kind") != "weekly_scoped":
+                continue
+            scope = item.get("scope")
+            model = scope.get("model") if isinstance(scope, dict) else None
+            if not isinstance(model, dict):
+                continue
+            display_name = next((str(model.get(field) or "").strip() for field in ("display_name", "name", "id")
+                                 if str(model.get(field) or "").strip()), "")
+            percent = item.get("percent")
+            if "fable" not in display_name.lower() or not _is_num(percent):
+                continue
+            used = float(percent)
+            if not math.isfinite(used):
+                continue
+            windows.append(AccountUsageWindow(
+                label="Fable 5 week", used_percent=max(0.0, min(100.0, used)),
+                reset_at=_parse_dt(item.get("resets_at")), detail=f"Model-scoped allowance for {display_name}"))
+            break
     details: list[str] = []
     extra = payload.get("extra_usage") or {}
     used_credits, monthly_limit = extra.get("used_credits"), extra.get("monthly_limit")
