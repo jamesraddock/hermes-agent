@@ -2449,6 +2449,10 @@ def _rotate_worker_log(
 def _module_hermes_argv() -> list[str]:
     """Interpreter-bound Hermes CLI invocation (``hermes_cli.main`` is the
     console-script target — there is no top-level ``hermes`` package)."""
+    from hermes_cli._launchers import installation_command, resolve_store_python
+    root = Path(__file__).resolve().parents[1]
+    if resolve_store_python(root) is not None:
+        return installation_command(root)
     return [sys.executable, "-m", "hermes_cli.main"]
 
 

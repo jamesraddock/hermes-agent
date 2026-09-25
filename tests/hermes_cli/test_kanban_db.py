@@ -1559,6 +1559,8 @@ def test_resolve_hermes_argv_prefers_module_form_over_path_shim(monkeypatch):
     import sys
     from hermes_cli import kanban_db_dispatch as kbd
 
+    from hermes_cli import _launchers
+    monkeypatch.setattr(_launchers, "resolve_store_python", lambda root: None)
     monkeypatch.delenv("HERMES_BIN", raising=False)
     monkeypatch.setattr(shutil, "which", lambda name: "/tmp/planted/hermes")
     monkeypatch.setattr(kbd, "_safe_which_no_cwd", lambda name: "/tmp/planted/hermes")
@@ -2008,3 +2010,12 @@ def test_archive_non_running_task_does_not_attempt_termination(kanban_home):
             (t,),
         ).fetchone()
         assert row is None
+
+
+def test_managed_worker_uses_installation_launcher_outside_repo(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db_dispatch as kbd, _launchers
+    monkeypatch.delenv("HERMES_BIN", raising=False)
+    monkeypatch.setattr(_launchers, "resolve_store_python", lambda root: tmp_path / "store-python")
+    monkeypatch.chdir(tmp_path)
+    root = Path(kbd.__file__).resolve().parents[1]
+    assert kbd._resolve_hermes_argv() == [str(root / ".hermes/bin/hermes")]
