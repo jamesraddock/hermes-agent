@@ -262,16 +262,19 @@ def test_export_preserves_workflow_state_but_disables_execution(board, tmp_path)
     assert wf.configuration(conn)[1]
 
 
-def test_release_evidence_finishes_same_card_and_is_idempotent(board):
+@pytest.mark.parametrize("fail_after_commit", [False, True])
+def test_release_evidence_finishes_same_card_and_is_idempotent(board, monkeypatch, fail_after_commit):
     _, conn, workspace = board
     spec = definition()
     spec["steps"]["merge"]["decisions"] = {"approve": "release"}
     spec["steps"]["release"] = {"hold": True, "decisions": {"complete": "done"},
                                 "completion_required": ["source", "release", "verification", "artifacts"],
                                 "completion_matches": {"source": "implement.artifact"}}
-    spec["steps"]["done"] = {"hold": True, "terminal": True}
+    spec["steps"]["done"] = {"hold": True, "terminal": True, "decisions": {"revise": "plan"}}
     wf.configure(conn, spec)
     tid = wf.start(conn, issue="example/repo#55", title="Finish", workspace_path=workspace)
+    child = wf.start(conn, issue="example/repo#57", title="Dependent feature", workspace_path=workspace, parents=[tid])
+    assert kb.get_task(conn, child).status == "todo"
     wf.set_enabled(conn, True)
     for _ in range(5):
         finish(conn, kb.claim_task(conn, tid))
@@ -290,14 +293,32 @@ def test_release_evidence_finishes_same_card_and_is_idempotent(board):
     with pytest.raises(ValueError, match="reviewed packet"):
         wf.decide(conn, tid, evidence=evidence, **args)
     evidence["source"] = "revision-1"
+    if fail_after_commit:
+        def failed_refresh(_):
+            raise RuntimeError("simulated post-commit refresh failure")
+        with monkeypatch.context() as scoped:
+            scoped.setattr(kb, "recompute_ready", failed_refresh)
+            with pytest.raises(RuntimeError, match="post-commit"):
+                wf.decide(conn, tid, evidence=evidence, **args)
+        saved = wf.state(conn, tid)["evidence"]["release"]["data"]
+        assert Path(saved["artifacts"][0]).is_file()
+        kb.recompute_ready(conn)
     receipt = wf.decide(conn, tid, evidence=evidence, **args)
     assert receipt == wf.decide(conn, tid, evidence=evidence, **args)
     assert not receipt["release_executed"]
-    assert kb.get_task(conn, tid).status == "done"
+    finished = kb.get_task(conn, tid)
+    assert finished.status == "done" and finished.completed_at and finished.result == args["note"]
+    assert kb.get_task(conn, child).status == "ready"
+    assert len([e for e in kb.list_events(conn, tid) if e.kind == "completed"]) == 1
+    assert kb.list_runs(conn, tid)[-1].outcome == "completed"
     saved = wf.state(conn, tid)["evidence"]["release"]["data"]
     assert saved["artifacts"][0] != str(artifact)
     assert Path(saved["artifacts"][0]).read_text() == artifact.read_text()
-    assert len(kb.list_tasks(conn)) == 1 and kb.claim_task(conn, tid) is None
+    assert len(kb.list_tasks(conn)) == 2 and kb.claim_task(conn, tid) is None
+    packet = wf.state(conn, tid)
+    wf.decide(conn, tid, expected_revision=packet["revision"], packet_digest=wf.digest(packet["evidence"]),
+              decision="revise", decision_id="reopen-1", note="Explicit new scope on same feature")
+    assert kb.get_task(conn, tid).completed_at is None and kb.get_task(conn, tid).result is None
 
 
 def test_same_head_with_dirty_tracked_source_cannot_pass(board):
