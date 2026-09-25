@@ -2183,7 +2183,8 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
     with write_txn(conn):
         todo_rows = conn.execute(
             "SELECT id, status, consecutive_failures, max_retries "
-            "FROM tasks WHERE status IN ('todo', 'blocked')"
+            "FROM tasks WHERE status IN ('todo', 'blocked') "
+            "AND id NOT IN (SELECT task_id FROM kanban_task_retirements)"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
@@ -4387,7 +4388,9 @@ def gc_events(conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3
     with write_txn(conn):
         cur = conn.execute(
             "DELETE FROM task_events WHERE created_at < ? AND kind != 'decomposed' AND task_id IN "
-            "(SELECT id FROM tasks WHERE status IN ('done', 'archived'))", (cutoff,),
+            "(SELECT id FROM tasks WHERE status IN ('done', 'archived') "
+            "AND id NOT IN (SELECT task_id FROM kanban_task_retirements) "
+            "AND id NOT IN (SELECT task_id FROM kanban_workflow_state))", (cutoff,),
         )
     return int(cur.rowcount or 0)
 

@@ -94,11 +94,44 @@ def owners(conn, key):
                                  "idempotency_key LIKE 'feature:%' OR idempotency_key LIKE 'promote:%' "
                                  "OR idempotency_key LIKE 'github:%:%'"):
                 if owner_key(row[1]) == key:
-                    found.append((path.resolve(), row[0]))
+                    target = _transferred_owner(c, row[0])
+                    found.append(target or (path.resolve(), row[0]))
+            if _has_table(c, "kanban_workflow_migrations"):
+                import json
+                for migration in c.execute("SELECT task_id, manifest FROM kanban_workflow_migrations"):
+                    if key in json.loads(migration[1])["issue_keys"]:
+                        found.append((path.resolve(), migration[0]))
+            if _has_table(c, "kanban_task_retirements"):
+                import json
+                for retired in c.execute("SELECT task_id, issue_keys FROM kanban_task_retirements"):
+                    if key in json.loads(retired[1]):
+                        target = _transferred_owner(c, retired[0])
+                        found.append(target or (path.resolve(), retired[0]))
         finally:
             if other:
                 other.close()
-    return found
+    return sorted(set(found))
+
+
+def _has_table(conn, name):
+    return bool(conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone())
+
+
+def _transferred_owner(conn, task_id):
+    if not _has_table(conn, "kanban_task_retirements"):
+        return None
+    row = conn.execute("SELECT target_db, target_task, manifest_hash FROM kanban_task_retirements WHERE task_id=?", (task_id,)).fetchone()
+    if not row:
+        return None
+    target = Path(row[0])
+    # Missing/unreadable target is an error, never permission to create another owner.
+    with contextlib.closing(sqlite3.connect(target.as_uri() + "?mode=ro", uri=True, timeout=2)) as other:
+        if not _has_table(other, "kanban_workflow_migrations"):
+            return None
+        receipt = other.execute("SELECT finalized, manifest_hash FROM kanban_workflow_migrations WHERE task_id=?", (row[1],)).fetchone()
+        if receipt and receipt[0] and receipt[1] == row[2]:
+            return target.resolve(), row[1]
+    return None
 
 
 @contextlib.contextmanager
@@ -108,7 +141,7 @@ def creation_guard(conn, idempotency_key, assignee=None):
         import json
         if assignee in json.loads(row[0]):
             raise ValueError("this board has retired that feature worker; use the replacement workflow")
-    key = execution_key(idempotency_key)
+    key = owner_key(idempotency_key)
     if key is None:
         yield None
         return

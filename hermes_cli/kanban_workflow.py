@@ -41,6 +41,8 @@ def validate_definition(value):
     steps = value.get("steps")
     if not isinstance(steps, dict) or value.get("start") not in steps:
         raise ValueError("workflow start must name a step")
+    if steps[value["start"]].get("terminal"):
+        raise ValueError("workflow cannot start completed")
     for name, step in steps.items():
         if not isinstance(name, str) or not isinstance(step, dict):
             raise ValueError("steps must map names to step definitions")
@@ -54,6 +56,9 @@ def validate_definition(value):
                 raise ValueError(f"{name}: invalid operator decision target")
             if "revise" in decisions and steps[decisions["revise"]].get("inputs"):
                 raise ValueError(f"{name}: operator revise must return to a stage with no input evidence")
+            if any(steps[target].get("terminal") and decision != "complete"
+                   for decision, target in decisions.items()):
+                raise ValueError("only complete may target a terminal stage")
             required = step.get("completion_required", [])
             if not isinstance(required, list) or any(not isinstance(k, str) or not k for k in required):
                 raise ValueError(f"{name}: invalid completion evidence contract")
@@ -70,7 +75,7 @@ def validate_definition(value):
         kb.normalize_reasoning_effort(step["effort"])
         if step.get("next") not in steps or (step.get("changes") and step["changes"] not in steps):
             raise ValueError(f"{name}: invalid transition target")
-        if steps[step["next"]].get("terminal"):
+        if any(steps[target].get("terminal") for target in (step.get("next"), step.get("changes")) if target):
             raise ValueError(f"{name}: workers cannot directly complete the feature")
         for field in ("inputs", "required", "skills"):
             items = step.get(field, [])
@@ -85,7 +90,7 @@ def validate_definition(value):
             raise ValueError(f"{name}: matches must refer to declared input fields")
     if any(s.get("changes") for s in steps.values()):
         escalation = steps.get(value.get("escalation"), {})
-        if escalation.get("hold") is not True:
+        if escalation.get("hold") is not True or escalation.get("terminal"):
             raise ValueError("revision workflows need an escalation hold")
     repositories = value.get("repositories", {})
     if not isinstance(repositories, dict) or any(not isinstance(repo, dict)
@@ -141,6 +146,10 @@ def set_admission(conn, *, paused=False, retired_assignees=()):
 
 
 def admission(conn, task=None):
+    if task and conn.execute("SELECT 1 FROM kanban_task_retirements WHERE task_id=?", (task.id,)).fetchone():
+        return False
+    if task and conn.execute("SELECT 1 FROM kanban_workflow_migrations WHERE task_id=? AND finalized=0", (task.id,)).fetchone():
+        return False
     row = conn.execute("SELECT paused, retired_assignees FROM kanban_admission_policy WHERE singleton=1").fetchone()
     if row and row[0]:
         return False
@@ -395,10 +404,14 @@ def decide(conn, task_id, *, expected_revision, packet_digest, decision, note, d
     access as the same OS user. External approvals need an authenticated adapter.
     """
     _operator_only()
+    if conn.execute("SELECT 1 FROM kanban_workflow_migrations WHERE task_id=? AND finalized=0", (task_id,)).fetchone():
+        raise ValueError("finish the pending ownership transfer before deciding")
     if not isinstance(note, str) or not note.strip():
         raise ValueError("record the operator decision and its source")
     if not isinstance(decision_id, str) or not decision_id.strip():
         raise ValueError("decision_id is required")
+    if evidence is not None and decision != "complete":
+        raise ValueError("evidence is only accepted by the complete decision")
     request_hash = digest({"revision": expected_revision, "packet": packet_digest, "decision": decision, "note": note, "evidence": evidence})
     staged = []
     try:

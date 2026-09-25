@@ -96,6 +96,8 @@ _STEP_HANDOFF = (
 
 _WORKFLOW_SPECS = [
     _cmd("configure", [_arg("file")], help="Install a workflow definition (initially disabled)"),
+    _cmd("migrate", [_arg("file"), _arg("--source-db", required=True)],
+         help="Transfer a reviewed legacy cohort into a held workflow card"),
     _cmd("enable", help="Enable dispatch for the configured workflow"),
     _cmd("disable", help="Stop new workflow claims; existing workers retain their runs"),
     _cmd("start", [_arg("--issue", required=True), _arg("--title", required=True),

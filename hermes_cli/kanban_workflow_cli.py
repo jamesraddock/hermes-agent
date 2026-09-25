@@ -6,9 +6,16 @@ from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_workflow as wf
 
 
+def _migrate(conn, args):
+    from hermes_cli.kanban_workflow_migration import migrate
+    with kbc.connect_closing(Path(args.source_db)) as source:
+        return migrate(conn, source, json.loads(Path(args.file).read_text()))
+
+
 def command(args):
     with kbc.connect_closing() as conn:
         handlers = {
+            "migrate": lambda: _migrate(conn, args),
             "configure": lambda: wf.configure(conn, json.loads(Path(args.file).read_text())),
             "enable": lambda: wf.set_enabled(conn, True),
             "disable": lambda: wf.set_enabled(conn, False),
