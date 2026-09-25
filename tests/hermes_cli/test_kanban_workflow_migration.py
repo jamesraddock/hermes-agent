@@ -128,3 +128,17 @@ def test_changed_artifact_refuses_transfer(transfer):
     with pytest.raises(ValueError, match="artifact changed"):
         migration.migrate(target, source, manifest)
     assert target.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+
+
+def test_owner_scan_ignores_incident_backups_but_keeps_archived_boards(transfer):
+    source, target, manifest = transfer
+    old = ad.db_path(source)
+    incident = old.parent / "incident-backup" / "kanban.db"
+    incident.parent.mkdir(); incident.write_bytes(b"malformed historical evidence")
+    root_id = source.execute("SELECT id FROM tasks WHERE idempotency_key=?", ("promote:" + manifest["issue"],)).fetchone()[0]
+    assert ad.owners(target, manifest["issue"]) == [(old, root_id)]
+    archived = old.parent.parent / "_archived" / "historical-board" / "kanban.db"
+    archived.parent.mkdir(parents=True)
+    with sqlite3.connect(archived) as copy:
+        source.backup(copy)
+    assert len(ad.owners(target, manifest["issue"])) == 2

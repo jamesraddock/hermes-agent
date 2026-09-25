@@ -81,7 +81,9 @@ def owners(conn, key):
     default = root / "kanban.db"
     if default.exists():
         paths.add(default)
-    paths.update((root / "kanban" / "boards").rglob("kanban.db"))
+    boards = root / "kanban" / "boards"
+    paths.update(boards.glob("*/kanban.db"))
+    paths.update((boards / "_archived").glob("*/kanban.db"))
     found = []
     for path in sorted(paths):
         # Never connect through profile/env resolution: a worker pins its own DB.
