@@ -134,11 +134,16 @@ def set_enabled(conn, enabled):
         conn.execute("UPDATE kanban_workflow_config SET enabled=? WHERE singleton=1", (int(enabled),))
 
 
-def set_admission(conn, *, paused=False, retired_assignees=()):
+def set_admission(conn, *, paused=None, retired_assignees=None):
     _operator_only()
-    if any(not isinstance(p, str) or not p.strip() for p in retired_assignees):
+    if retired_assignees is not None and any(not isinstance(p, str) or not p.strip() for p in retired_assignees):
         raise ValueError("retired assignees must be nonempty profile names")
     with kb.write_txn(conn):
+        previous = conn.execute("SELECT paused, retired_assignees FROM kanban_admission_policy WHERE singleton=1").fetchone()
+        if paused is None:
+            paused = bool(previous[0]) if previous else False
+        if retired_assignees is None:
+            retired_assignees = json.loads(previous[1]) if previous else []
         conn.execute("INSERT INTO kanban_admission_policy VALUES (1, ?, ?) "
                      "ON CONFLICT(singleton) DO UPDATE SET paused=excluded.paused, "
                      "retired_assignees=excluded.retired_assignees",

@@ -108,8 +108,9 @@ _WORKFLOW_SPECS = [
                     _arg("--packet-digest", required=True), _arg("--decision-id", required=True),
                     _arg("--decision", required=True), _arg("--evidence-file"),
                     _arg("--note", required=True)], help="Record an operator decision on the same card"),
-    _cmd("admission", [_arg("--paused", action="store_true"),
-                        _arg("--retired-assignee", action="append", default=[])],
+    _cmd("admission", [_arg("--paused", action="store_true", default=None),
+                        _arg("--resume", dest="paused", action="store_false", default=None),
+                        _arg("--retired-assignee", action="append", default=None)],
          help="Pause board dispatch or retire specific worker profiles"),
 ]
 

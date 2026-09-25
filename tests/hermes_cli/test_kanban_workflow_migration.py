@@ -149,3 +149,20 @@ def test_historical_identity_namespaces_and_boundary_suffixes():
     assert ad.owner_key("promote:custom-card") is None
     assert ad.owner_key("github:Org/Repo#966:B1a:plan") == "github:org/repo#966"
     assert ad.owner_key("github:Org/Repo#966") is None  # inbox mirror
+
+
+def test_manifest_cannot_silently_redirect_an_omitted_alias(transfer):
+    source, target, manifest = transfer
+    manifest["issue_keys"] = [manifest["issue"]]
+    with pytest.raises(ValueError, match="omits source issue alias"):
+        migration.migrate(target, source, manifest)
+    assert target.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+
+
+def test_pause_preserves_retired_profiles(transfer):
+    source, _, _ = transfer
+    wf.set_admission(source, paused=False, retired_assignees=["retired"])
+    wf.set_admission(source, paused=True)
+    wf.set_admission(source, paused=False)
+    row = source.execute("SELECT * FROM kanban_admission_policy").fetchone()
+    assert row["paused"] == 0 and json.loads(row["retired_assignees"]) == ["retired"]

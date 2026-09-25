@@ -32,6 +32,9 @@ def _check_sources(source, manifest, target_path, target_id, fingerprint):
         raise ValueError("pause source-board admission during ownership transfer")
     for tid, expected in manifest["source_tasks"].items():
         current = snapshot(source, [tid])[tid]
+        owned_key = admission.owner_key(current["idempotency_key"])
+        if owned_key and owned_key not in manifest["issue_keys"]:
+            raise ValueError(f"manifest omits source issue alias: {tid}")
         if current != expected:
             raise ValueError(f"source task changed since reviewed manifest: {tid}")
         if current["current_run_id"] or current["worker_pid"] or current["claim_lock"] or current["status"] == "running":
