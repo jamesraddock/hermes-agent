@@ -170,8 +170,10 @@ def _route(conn, task_id, definition, step_key):
                  "worker_pid=NULL, worker_started_at=NULL, consecutive_failures=0 WHERE id=?",
                  (step_key, step.get("profile"), json.dumps(step.get("skills", [])), step.get("model"),
                   step.get("provider"), step.get("effort"), status, task_id))
-    if hold:
-        kb._append_event(conn, task_id, "completed" if step.get("terminal") else "blocked", {"reason": step.get("instruction", "Human decision required"),
+    if not step.get("terminal"):
+        conn.execute("UPDATE tasks SET completed_at=NULL, result=NULL WHERE id=?", (task_id,))
+    if hold and not step.get("terminal"):
+        kb._append_event(conn, task_id, "blocked", {"reason": step.get("instruction", "Human decision required"),
                                                   "actor": "workflow", "step": step_key})
 
 
@@ -455,7 +457,22 @@ def decide(conn, task_id, *, expected_revision, packet_digest, decision, note, d
                        "from": task.current_step_key, "to": target, "revision": expected_revision+1,
                        "release_executed": False}
             kb._append_event(conn, task_id, "workflow_operator_decision", receipt)
-            return receipt
+            terminal = definition["steps"][target].get("terminal") is True
+            final_run = None
+            if terminal:
+                conn.execute("UPDATE tasks SET completed_at=?, result=?, block_kind=NULL, block_recurrences=0 WHERE id=?",
+                             (int(time.time()), note, task_id))
+                final_run = kb._synthesize_ended_run(conn, task_id, outcome="completed", summary=note,
+                                                   metadata={"operator_decision": receipt, "release": metadata})
+                kb._append_event(conn, task_id, "completed",
+                                 kb._completed_event_payload(note, note, [], metadata), run_id=final_run)
+        # The files now belong to committed evidence, even if a post-commit
+        # observer/readiness refresh fails. A retry must not erase them.
+        staged.clear()
+        if terminal:
+            kb.recompute_ready(conn)
+            kb._fire_task_hook("kanban_task_completed", kb.get_task(conn, task_id), task_id, final_run, summary=note)
+        return receipt
     except Exception:
         if staged:
             kb._discard_staged_copies(staged, staged[0].parent)
