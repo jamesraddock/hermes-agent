@@ -82,6 +82,24 @@ _STEP_HANDOFF = (
     _arg("--metadata", help="JSON dict of structured facts to store on the latest completed run."),
 )
 
+_WORKFLOW_SPECS = [
+    _cmd("configure", [_arg("file")], help="Install a workflow definition (initially disabled)"),
+    _cmd("enable", help="Enable dispatch for the configured workflow"),
+    _cmd("disable", help="Stop new workflow claims; existing workers retain their runs"),
+    _cmd("start", [_arg("--issue", required=True), _arg("--title", required=True),
+                    _arg("--workspace"), _arg("--body-file")],
+         help="Admit one canonical issue to this board's workflow"),
+    _cmd("show", [_TASK_ID], help="Show durable stage evidence"),
+    _cmd("decide", [_TASK_ID, _arg("--revision", type=int, required=True),
+                    _arg("--packet-digest", required=True), _arg("--decision-id", required=True),
+                    _arg("--decision", required=True), _arg("--evidence-file"),
+                    _arg("--note", required=True)], help="Record an operator decision on the same card"),
+    _cmd("admission", [_arg("--paused", action="store_true"),
+                        _arg("--retired-assignee", action="append", default=[])],
+         help="Pause board dispatch or retire specific worker profiles"),
+]
+
+
 _BOARD_SPECS = [
     _cmd("list", [
         _json_flag(),
@@ -137,6 +155,8 @@ _BOARD_SPECS = [
 # Top-level ``hermes kanban <action>`` records, in ``--help`` order.
 _SPECS = [
     _cmd("init", help="Create kanban.db if missing (idempotent)"),
+    _cmd("workflow", children=("workflow_action", _WORKFLOW_SPECS),
+         help="Configure and operate durable same-card workflows"),
     _cmd("boards", children=("boards_action", _BOARD_SPECS),
          help="Manage kanban boards (one board per project / workstream)",
          description=(

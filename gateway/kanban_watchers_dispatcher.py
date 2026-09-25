@@ -252,6 +252,10 @@ class _KanbanDispatcher:
             for slug in self._board_slugs():
                 if attempted >= auto_decompose_per_tick:
                     break
+                from hermes_cli.kanban_workflow import admission, configuration
+                with _kbc().connect_closing(board=slug) as conn:
+                    if not admission(conn) or configuration(conn)[0] is not None:
+                        continue
                 # Pin the board via env for the call: the decomposer connects
                 # with no board kwarg (same pattern as the dashboard specify endpoint).
                 prev_env = os.environ.get("HERMES_KANBAN_BOARD")

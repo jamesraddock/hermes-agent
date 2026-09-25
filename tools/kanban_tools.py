@@ -179,7 +179,11 @@ def _worker_run_id(task_id: str) -> Optional[int]:
 def _stamp_worker_session_metadata(task_id: str, metadata: Optional[dict]) -> Optional[dict]:
     """Add trusted worker session id metadata for this worker's own task."""
     session_id = _own_task_env(task_id, "HERMES_SESSION_ID")
-    return {**(metadata or {}), "worker_session_id": session_id} if session_id else metadata
+    stamped = dict(metadata or {})
+    stamped.pop("worker_session_id", None)
+    if session_id:
+        stamped["worker_session_id"] = session_id
+    return stamped if metadata is not None or session_id else None
 
 
 def _enforce_worker_task_ownership(tid: str) -> None:
@@ -330,10 +334,10 @@ def _opt_int(value: Any, default: Optional[int] = None) -> Optional[int]:
 _TASK_FIELDS = tuple(
     "id title body assignee status tenant priority workspace_kind workspace_path created_by "
     "created_at started_at completed_at result current_run_id model_override "
-    "provider_override completion_contract last_failure_error".split())
+    "provider_override completion_contract last_failure_error workflow_template_id current_step_key".split())
 _TASK_SUMMARY_FIELDS = tuple(
     "id title assignee status priority tenant workspace_kind workspace_path project_id created_by "
-    "created_at started_at completed_at current_run_id model_override provider_override".split())
+    "created_at started_at completed_at current_run_id model_override provider_override workflow_template_id current_step_key".split())
 _RUN_FIELDS = tuple("id profile status outcome summary error metadata started_at ended_at".split())
 _COMMENT_FIELDS = ("author", "body", "created_at")
 _EVENT_FIELDS = ("kind", "payload", "created_at", "run_id")
@@ -612,7 +616,8 @@ def _handle_complete(args: dict, **kw) -> str:
         _check(ok, (task.last_failure_error if task else None) or
                f"could not complete {tid} (unknown id, stale run, or already terminal)")
         run = kb.latest_run(conn, tid)
-        return _ok(task_id=tid, run_id=run.id if run else None)
+        return _ok(task_id=tid, run_id=run.id if run else None,
+                   status=task.status, current_step_key=task.current_step_key)
 
 
 @_kanban_handler("kanban_block")
