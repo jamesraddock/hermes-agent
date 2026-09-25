@@ -35,12 +35,16 @@ def execution_key(value):
 
 
 def owner_key(value):
-    key = execution_key(value)
+    if not isinstance(value, str):
+        return None
+    try:
+        key = execution_key(value)
+    except ValueError:
+        key = None  # historical non-issue idempotency namespaces are not owners
     if key:
         return key
-    if isinstance(value, str) and value.startswith("github:") and ":" in value[7:]:
-        return issue_key(value.rsplit(":", 1)[0])
-    return None
+    match = re.match(r"^github:([\w.-]+/[\w.-]+)#([1-9][0-9]*):", value, re.IGNORECASE)
+    return issue_key(match[1] + "#" + match[2]) if match else None
 
 
 def db_path(conn):

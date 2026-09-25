@@ -142,3 +142,10 @@ def test_owner_scan_ignores_incident_backups_but_keeps_archived_boards(transfer)
     with sqlite3.connect(archived) as copy:
         source.backup(copy)
     assert len(ad.owners(target, manifest["issue"])) == 2
+
+
+def test_historical_identity_namespaces_and_boundary_suffixes():
+    assert ad.owner_key("feature:local-maintenance") is None
+    assert ad.owner_key("promote:custom-card") is None
+    assert ad.owner_key("github:Org/Repo#966:B1a:plan") == "github:org/repo#966"
+    assert ad.owner_key("github:Org/Repo#966") is None  # inbox mirror
