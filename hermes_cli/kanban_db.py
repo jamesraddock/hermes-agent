@@ -1081,6 +1081,11 @@ CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_
 """
 
 
+from hermes_cli.kanban_workflow_schema import SCHEMA as _WORKFLOW_SCHEMA
+
+SCHEMA_SQL += _WORKFLOW_SCHEMA
+
+
 # --- ID generation ---
 
 def _new_task_id() -> str:
@@ -1252,7 +1257,30 @@ def _normalize_task_skills(skills: Optional[Iterable[str]]) -> Optional[list[str
     return cleaned
 
 
-def create_task(
+def create_task(conn, **kwargs):
+    from hermes_cli.kanban_workflow import configuration, start
+    from hermes_cli.kanban_workflow_admission import creation_guard, execution_key
+    if configuration(conn)[0]:
+        key = execution_key(kwargs.get("idempotency_key"))
+        if not key:
+            raise ValueError("workflow boards accept canonical feature intake, not phase cards")
+        first = configuration(conn)[0]["steps"][configuration(conn)[0]["start"]]
+        for field, config_field in (("assignee", "profile"), ("model_override", "model"),
+                                    ("provider_override", "provider"), ("reasoning_effort", "effort")):
+            if kwargs.get(field) is not None and kwargs[field] != first[config_field]:
+                raise ValueError(f"{field} is pinned by the board workflow definition")
+        return start(conn, issue=key, title=kwargs["title"], body=kwargs.get("body"),
+                     workspace_path=kwargs.get("workspace_path"), board=kwargs.get("board"),
+                     parents=kwargs.get("parents", ()), tenant=kwargs.get("tenant"),
+                     priority=kwargs.get("priority", 0), created_by=kwargs.get("created_by") or "workflow-intake",
+                     session_id=kwargs.get("session_id"))
+    with creation_guard(conn, kwargs.get("idempotency_key"), kwargs.get("assignee")) as existing:
+        if existing:
+            return existing
+        return _create_task(conn, **kwargs)
+
+
+def _create_task(
     conn: sqlite3.Connection, *, title: str, body: Optional[str] = None,
     assignee: Optional[str] = None, created_by: Optional[str] = None,
     workspace_kind: Optional[str] = None, workspace_path: Optional[str] = None,
@@ -1554,6 +1582,9 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     """Assign/reassign; raises RuntimeError while the task is running under a claim."""
     profile = _canonical_assignee(profile)
     with write_txn(conn):
+        from hermes_cli.kanban_workflow import managed
+        if managed(conn, get_task(conn, task_id)):
+            raise ValueError("workflow roles are pinned by the board definition; use workflow decide for recovery")
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
@@ -1604,6 +1635,9 @@ def _set_task_override(
     """Per-task override write: refuse archived tasks, record ``event_kind``,
     then fire the task-updated observer AFTER commit (RFC #58548)."""
     with write_txn(conn):
+        from hermes_cli.kanban_workflow import managed
+        if managed(conn, get_task(conn, task_id)):
+            raise ValueError("workflow models are pinned by the board definition")
         status = _task_status(conn, task_id)
         if status is None:
             return False
@@ -2266,7 +2300,15 @@ def _claim_and_open_run(
     return run_id
 
 
-def claim_task(
+def claim_task(conn, task_id, *, ttl_seconds=None, claimer=None):
+    from hermes_cli.kanban_workflow_admission import claim_guard
+    with claim_guard(conn, task_id) as admitted:
+        if not admitted:
+            return None
+        return _claim_task(conn, task_id, ttl_seconds=ttl_seconds, claimer=claimer)
+
+
+def _claim_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
 ) -> Optional[Task]:
@@ -2279,6 +2321,9 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        from hermes_cli.kanban_workflow import admission
+        if not admission(conn, get_task(conn, task_id)):
+            return None
         # Single enforcement point: never ready -> running with an undone
         # parent, whichever writer set 'ready'. Demote to 'todo';
         # recompute_ready re-promotes when the parents finish.
@@ -2301,7 +2346,15 @@ def claim_task(
     return claimed
 
 
-def claim_review_task(
+def claim_review_task(conn, task_id, *, ttl_seconds=None, claimer=None):
+    from hermes_cli.kanban_workflow_admission import claim_guard
+    with claim_guard(conn, task_id) as admitted:
+        if not admitted:
+            return None
+        return _claim_review_task(conn, task_id, ttl_seconds=ttl_seconds, claimer=claimer)
+
+
+def _claim_review_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
 ) -> Optional[Task]:
@@ -2312,6 +2365,9 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        from hermes_cli.kanban_workflow import admission
+        if not admission(conn, get_task(conn, task_id)):
+            return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -2749,6 +2805,19 @@ def complete_task(
     whitespace-only evidence raises :class:`EmptyCompletionError` after an
     auditable event. Approving a card out of ``review`` stays exempt.
     """
+    task = get_task(conn, task_id)
+    from hermes_cli.kanban_workflow import managed
+    if managed(conn, task):
+        from hermes_cli.kanban_workflow import advance
+        handoff = (metadata or {}).get("workflow")
+        if not isinstance(handoff, dict):
+            raise ValueError("workflow stage completion requires metadata.workflow; final release is a human hold")
+        advance(conn, task_id, expected_run_id=expected_run_id,
+                expected_step=handoff.get("step"), revision=handoff.get("revision"),
+                decision=handoff.get("decision"), evidence=handoff.get("evidence"),
+                inputs=handoff.get("inputs"), summary=summary or result,
+                transition_id=handoff.get("transition_id"), worker_session_id=(metadata or {}).get("worker_session_id"))
+        return True
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
@@ -3372,6 +3441,11 @@ def request_review(
     task stays ``running`` and retryable, with no attachments and no event.
     """
 
+    task = get_task(conn, task_id)
+    from hermes_cli.kanban_workflow import managed
+    if managed(conn, task):
+        raise ValueError("use the configured workflow stage handoff on this card")
+
     def _ret(ok: bool, reason: Optional[str] = None):
         return (ok, reason) if with_reason else ok
 
@@ -3504,6 +3578,9 @@ def request_changes(
     """Close an active reviewer run (claimed from ``review``) and hand the task
     back to the implementer from the latest ``review_requested`` event, parent
     gating reapplied. Returns ``(ok, implementer | reason)``."""
+    from hermes_cli.kanban_workflow import managed
+    if managed(conn, get_task(conn, task_id)):
+        return False, "use the configured workflow stage handoff on this card"
     reason = str(redact_review_value(reason or "")).strip()
     if not reason:
         return False, "reason is required"
@@ -3650,6 +3727,11 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
     when that is where it left off), closing any leaked run first."""
+    task = get_task(conn, task_id)
+    from hermes_cli.kanban_workflow import managed
+    if managed(conn, task):
+        raise ValueError("use the configured workflow stage handoff on this card")
+
     now = int(time.time())
     with write_txn(conn):
         resume_status = (
@@ -3998,6 +4080,8 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     now = int(time.time())
     lines: list[str] = []
     _ctx_header(lines, task)
+    from hermes_cli.kanban_workflow import context
+    lines.append(context(conn, task))
     _ctx_attachments(lines, list_attachments(conn, task_id))
     _ctx_prior_attempts(lines, conn, task_id, now)
     _ctx_parent_results(lines, conn, task_id, now)

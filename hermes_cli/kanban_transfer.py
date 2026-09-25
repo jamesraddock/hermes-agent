@@ -71,6 +71,10 @@ def _scrub_local_state(conn: sqlite3.Connection) -> None:
     """Strip machine-local runtime state (claims, PIDs, and above all the
     gateway chat ids subscribed to task events). Caller owns the transaction.
     Run on export and again on import (an archive is untrusted input)."""
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='kanban_workflow_config'").fetchone():
+        # Imported workflow cards keep their evidence/history but require an
+        # operator to reconcile paths and ownership before enabling execution.
+        conn.execute("UPDATE kanban_workflow_config SET enabled=0")
     conn.execute("DELETE FROM kanban_notify_subs")
     conn.execute(
         """
