@@ -13,9 +13,15 @@ def _migrate(conn, args):
 
 
 def command(args):
+    from hermes_cli import kanban_workflow_recovery as recovery
     with kbc.connect_closing() as conn:
         handlers = {
             "migrate": lambda: _migrate(conn, args),
+            "upgrade": lambda: recovery.upgrade(conn, json.loads(Path(args.file).read_text()),
+                                                 expected_digest=args.definition_digest, note=args.note),
+            "resume": lambda: recovery.resume(conn, args.task_id, target=args.step,
+                                               expected_revision=args.revision, packet_digest=args.packet_digest,
+                                               note=args.note, decision_id=args.decision_id),
             "configure": lambda: wf.configure(conn, json.loads(Path(args.file).read_text())),
             "enable": lambda: wf.set_enabled(conn, True),
             "disable": lambda: wf.set_enabled(conn, False),

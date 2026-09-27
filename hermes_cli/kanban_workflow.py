@@ -51,6 +51,10 @@ def validate_definition(value):
         if step.get("hold") is True:
             if step.get("profile") or step.get("next") or step.get("changes"):
                 raise ValueError("human holds cannot dispatch or advance automatically")
+            for field in ("resume_steps", "approval_inputs"):
+                refs = step.get(field, [])
+                if not isinstance(refs, list) or any(ref not in steps or steps[ref].get("hold") for ref in refs):
+                    raise ValueError(f"{name}: {field} must name worker stages")
             decisions = step.get("decisions", {})
             if not isinstance(decisions, dict) or any(k not in ("approve", "revise", "complete") or v not in steps for k, v in decisions.items()):
                 raise ValueError(f"{name}: invalid operator decision target")
@@ -73,6 +77,11 @@ def validate_definition(value):
         if not all(isinstance(step.get(k), str) and step[k].strip() for k in ("profile", "model", "provider", "effort")):
             raise ValueError(f"{name}: explicit profile/model/provider/effort required")
         kb.normalize_reasoning_effort(step["effort"])
+        if type(step.get("resolve_findings", False)) is not bool:
+            raise ValueError(f"{name}: resolve_findings must be boolean")
+        equals = step.get("equals", {})
+        if not isinstance(equals, dict) or any(k not in step.get("required", []) for k in equals):
+            raise ValueError(f"{name}: equals must constrain required evidence fields")
         if step.get("next") not in steps or (step.get("changes") and step["changes"] not in steps):
             raise ValueError(f"{name}: invalid transition target")
         if any(steps[target].get("terminal") for target in (step.get("next"), step.get("changes")) if target):
@@ -249,8 +258,16 @@ def state(conn, task_id):
     row = conn.execute("SELECT * FROM kanban_workflow_state WHERE task_id=?", (task_id,)).fetchone()
     if not row:
         raise ValueError("task has no native workflow state")
+    # A blocked retry does not erase the last review's actionable findings.
+    last = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='workflow_advanced' "
+                        "ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+    event = json.loads(last[0]) if last else {}
+    pending = []
+    if event.get("decision") == "changes":
+        run = kb.get_run(conn, event["run_id"])
+        pending = (run.metadata or {}).get("findings", [])
     return {"revision": row["revision"], "evidence": json.loads(row["evidence"]),
-            "corrections": json.loads(row["corrections"])}
+            "corrections": json.loads(row["corrections"]), "pending_findings": pending}
 
 
 
@@ -260,7 +277,9 @@ def packet(conn, task_id):
     step = configuration(conn)[0]["steps"][task.current_step_key]
     decisions = list(step.get("decisions", {})) if step.get("hold") else ["retry", "revise"]
     return {**current, "packet_digest": digest(current["evidence"]), "step": task.current_step_key,
-            "status": task.status, "instruction": step.get("instruction", ""), "decisions": decisions}
+            "status": task.status, "instruction": step.get("instruction", ""), "decisions": decisions,
+            "resume_steps": step.get("resume_steps", []),
+            "missing_approval_inputs": [s for s in step.get("approval_inputs", []) if s not in current["evidence"]]}
 
 def _preserve_artifacts(conn, task, metadata, staged):
     from hermes_cli.kanban_workflow_admission import db_path, installation_root
@@ -347,6 +366,16 @@ def advance(conn, task_id, *, expected_run_id, expected_step, revision, decision
                                           for k in step.get("required", [])):
                 raise ValueError("stage evidence is missing required fields")
             if decision == "pass":
+                for field, value in step.get("equals", {}).items():
+                    if type(evidence.get(field)) is not type(value) or evidence[field] != value:
+                        raise ValueError(f"{field} does not satisfy the stage pass contract")
+                if step.get("resolve_findings") and current["pending_findings"]:
+                    resolutions = evidence.get("resolutions", [])
+                    if (not isinstance(resolutions, list) or any(not isinstance(r, dict)
+                            or not all(isinstance(r.get(k), str) and r[k].strip()
+                                       for k in ("id", "change", "verification")) for r in resolutions)
+                            or {r["id"] for r in resolutions} != {str(f["id"]) for f in current["pending_findings"]}):
+                        raise ValueError("resolve each pending finding with a concrete change and verification; otherwise block")
                 for field, source in step.get("matches", {}).items():
                     upstream, upstream_field = source.split(".", 1)
                     if evidence.get(field) != current["evidence"][upstream]["data"].get(upstream_field):
@@ -460,6 +489,12 @@ def decide(conn, task_id, *, expected_revision, packet_digest, decision, note, d
                                                              "actor_surface": "local-operator-cli"}
                 conn.execute("UPDATE kanban_workflow_state SET evidence=? WHERE task_id=?",
                              (json.dumps(current["evidence"]), task_id))
+            if decision == "approve":
+                for name in step.get("approval_inputs", []):
+                    artifact = current["evidence"].get(name)
+                    if not artifact or any(current["evidence"].get(s, {}).get("digest") != d
+                                           for s, d in artifact.get("inputs", {}).items()):
+                        raise ValueError(f"approval requires current {name} evidence")
             source = step.get("head_from")
             if decision == "approve" and source:
                 source_stage, source_field = source.split(".", 1)
@@ -507,7 +542,8 @@ def context(conn, task):
     step = definition["steps"][task.current_step_key]
     return ("\n## Durable workflow\n" + json.dumps({"workflow": task.workflow_template_id,
             "step": task.current_step_key, "instruction": step.get("instruction", ""),
-            "required_evidence": step.get("required", []),
+            "required_evidence": step.get("required", []), "equals": step.get("equals", {}),
+            "resolve_findings": step.get("resolve_findings", False),
             "expected_inputs": {name: current["evidence"][name]["digest"] for name in step.get("inputs", [])
                                 if name in current["evidence"]},
             "matches": step.get("matches", {}), "git_head_required": step.get("git_head", False),

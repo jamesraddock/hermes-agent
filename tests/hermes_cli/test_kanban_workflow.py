@@ -397,3 +397,127 @@ def test_same_head_with_dirty_tracked_source_cannot_pass(board):
         finish(conn, task, result)
     source.write_text("answer = 1\n")
     assert finish(conn, task, result)
+
+
+def test_idle_upgrade_resumes_reviewed_card_through_pr_before_merge(board, monkeypatch, tmp_path):
+    """An inserted preparation stage cannot lose reviews or bypass approval prerequisites."""
+    from hermes_cli import kanban as cli, kanban_workflow_recovery as recovery
+    _, conn, workspace = board
+    old = definition()
+    old['steps']['merge']['decisions'] = {'approve': 'release'}
+    old['steps']['release'] = {'hold': True}
+    wf.configure(conn, old)
+    tid = wf.start(conn, issue='example/repo#80', title='Reviewed work', workspace_path=workspace)
+    wf.set_enabled(conn, True)
+    for _ in range(5):
+        finish(conn, kb.claim_task(conn, tid))
+    before = wf.state(conn, tid)
+    new = copy.deepcopy(old)
+    new['steps']['review']['next'] = 'prepare_pr'
+    new['steps']['prepare_pr'] = {**old['steps']['implement'], 'next': 'merge', 'changes': 'implement',
+                                 'inputs': ['implement', 'verify', 'review'],
+                                 'required': ['artifact', 'pull_request', 'ready'], 'equals': {'ready': True}}
+    new['steps']['merge']['approval_inputs'] = ['prepare_pr']
+    new['steps']['merge']['resume_steps'] = ['prepare_pr', 'implement']
+    file = tmp_path / 'upgrade.json'
+    file.write_text(json.dumps(new))
+    args = dict(expected_digest=wf.digest(old), note='Authorized PR continuation')
+    with pytest.raises(ValueError, match='disable dispatch'):
+        recovery.upgrade(conn, new, **args)
+    wf.set_enabled(conn, False)
+    bad = copy.deepcopy(new)
+    bad['steps']['merge']['decisions'] = {}
+    with pytest.raises(ValueError, match='preserve roles'):
+        recovery.upgrade(conn, bad, **args)
+    with pytest.raises(ValueError, match='definition changed'):
+        recovery.upgrade(conn, new, **{**args, 'expected_digest': 'stale'})
+    result = json.loads(cli.run_slash(f'--board delivery workflow upgrade {file} '
+                                     f'--definition-digest {wf.digest(old)} --note "Authorized continuation"'))
+    assert result['ok'] and not wf.configuration(conn)[1]
+    assert wf.state(conn, tid)['evidence'] == before['evidence']
+    packet = wf.packet(conn, tid)
+    assert packet['missing_approval_inputs'] == ['prepare_pr']
+    with pytest.raises(ValueError, match='requires current prepare_pr'):
+        wf.decide(conn, tid, expected_revision=packet['revision'], packet_digest=packet['packet_digest'],
+                  decision='approve', note='Not ready', decision_id='premature-merge')
+    kwargs = dict(target='prepare_pr', expected_revision=packet['revision'],
+                  packet_digest=packet['packet_digest'], note='Resume authorized PR work', decision_id='resume-pr')
+    monkeypatch.setenv('HERMES_KANBAN_TASK', tid)
+    with pytest.raises(PermissionError):
+        recovery.resume(conn, tid, **kwargs)
+    monkeypatch.delenv('HERMES_KANBAN_TASK')
+    with pytest.raises(ValueError, match='packet changed'):
+        recovery.resume(conn, tid, **{**kwargs, 'expected_revision': before['revision']})
+    with pytest.raises(ValueError, match='does not permit'):
+        recovery.resume(conn, tid, **{**kwargs, 'target': 'release'})
+    first = recovery.resume(conn, tid, **kwargs)
+    assert recovery.resume(conn, tid, **kwargs) == first
+    assert wf.state(conn, tid)['evidence'] == before['evidence']
+    wf.set_enabled(conn, True)
+    task = kb.claim_task(conn, tid)
+    assert task.current_step_key == 'prepare_pr'
+    data = handoff(conn, task)
+    data['evidence'].update(pull_request='https://example.invalid/pr/80', ready=False)
+    with pytest.raises(ValueError, match='pass contract'):
+        finish(conn, task, data)
+    data['evidence']['ready'] = True
+    finish(conn, task, data)
+    packet = wf.packet(conn, tid)
+    assert packet['step'] == 'merge' and not packet['missing_approval_inputs']
+    assert kb.claim_task(conn, tid) is None
+    wf.decide(conn, tid, expected_revision=packet['revision'], packet_digest=packet['packet_digest'],
+              decision='approve', note='Explicit merge approval', decision_id='merge-ready')
+    assert kb.get_task(conn, tid).current_step_key == 'release'
+    assert len(kb.list_tasks(conn)) == 1
+
+
+def test_correction_resume_keeps_plan_and_requires_actual_resolution(board):
+    """Repeated verification findings remain visible through a targeted recovery."""
+    from hermes_cli import kanban as cli
+    _, conn, workspace = board
+    spec = definition()
+    spec['steps']['implement']['resolve_findings'] = True
+    spec['steps']['decision']['resume_steps'] = ['implement', 'plan']
+    wf.configure(conn, spec)
+    tid = wf.start(conn, issue='example/repo#81', title='Remediate existing work', workspace_path=workspace)
+    wf.set_enabled(conn, True)
+    for _ in range(3):
+        finish(conn, kb.claim_task(conn, tid))
+    upstream = {k: v for k, v in wf.state(conn, tid)['evidence'].items() if k in ('plan', 'critique')}
+    for i in range(3):
+        task = kb.claim_task(conn, tid)
+        assert task.current_step_key == 'verify'
+        finish(conn, task, handoff(conn, task, 'changes'))
+        if i == 2:
+            break
+        task = kb.claim_task(conn, tid)
+        data = handoff(conn, task)
+        with pytest.raises(ValueError, match='resolve each pending finding'):
+            finish(conn, task, data)
+        data['evidence']['resolutions'] = [{'id': 'edge-case', 'change': f'Correction {i}',
+                                          'verification': 'Regression test evidence'}]
+        finish(conn, task, data)
+    packet = wf.packet(conn, tid)
+    assert packet['step'] == 'decision'
+    assert packet['corrections']['verify:edge-case'] == 3
+    assert packet['pending_findings'][0]['summary'] == 'Fix edge case'
+    command = (f'--board delivery workflow resume {tid} --step implement --revision {packet["revision"]} '
+               f'--packet-digest {packet["packet_digest"]} --decision-id correction-recovery '
+               '--note "Operator supplied concrete environment repair"')
+    result = json.loads(cli.run_slash(command))
+    assert result['ok'] and result['result']['previous_corrections']['verify:edge-case'] == 3
+    assert json.loads(cli.run_slash(command)) == result
+    current = wf.state(conn, tid)
+    assert current['evidence'] == upstream and not current['corrections']
+    assert current['pending_findings'] == packet['pending_findings']
+    task = kb.claim_task(conn, tid)
+    kb.block_task(conn, tid, reason='Access still missing', expected_run_id=task.current_run_id)
+    blocked = wf.packet(conn, tid)
+    assert blocked['pending_findings'] == packet['pending_findings']
+    wf.decide(conn, tid, expected_revision=blocked['revision'], packet_digest=blocked['packet_digest'],
+              decision='retry', note='Access provided', decision_id='access-restored')
+    task = kb.claim_task(conn, tid)
+    data = handoff(conn, task)
+    with pytest.raises(ValueError, match='resolve each pending finding'):
+        finish(conn, task, data)
+    assert len(kb.list_tasks(conn)) == 1
