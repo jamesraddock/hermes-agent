@@ -179,9 +179,11 @@ def _route(conn, task_id, definition, step_key):
     step = definition["steps"][step_key]
     hold = step.get("hold") is True
     status = "done" if step.get("terminal") else "blocked" if hold else kb._landing_status_after_parents(conn, task_id)
+    # A completed stage or authorized recovery starts a new attempt. Leaving
+    # the old error behind makes the dispatcher reject the next role as blocked.
     conn.execute("UPDATE tasks SET current_step_key=?, assignee=?, skills=?, model_override=?, "
                  "provider_override=?, reasoning_effort=?, status=?, claim_lock=NULL, claim_expires=NULL, "
-                 "worker_pid=NULL, worker_started_at=NULL, consecutive_failures=0 WHERE id=?",
+                 "worker_pid=NULL, worker_started_at=NULL, consecutive_failures=0, last_failure_error=NULL WHERE id=?",
                  (step_key, step.get("profile"), json.dumps(step.get("skills", [])), step.get("model"),
                   step.get("provider"), step.get("effort"), status, task_id))
     if not step.get("terminal"):

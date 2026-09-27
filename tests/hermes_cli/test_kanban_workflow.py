@@ -231,6 +231,59 @@ def test_operator_recovers_worker_failure_and_show_exposes_packet(board):
     assert kb.claim_task(conn, tid).current_step_key == "plan"
 
 
+@pytest.mark.parametrize("decision", ["pass", "changes"])
+def test_completed_stage_releases_old_failure_guard_for_next_profile(board, decision):
+    home, conn, workspace = board
+    for profile in ("planner", "critic", "implementer"):
+        directory = home / "profiles" / profile
+        directory.mkdir(parents=True)
+        (directory / "config.yaml").write_text("{}\n")
+    tid = wf.start(conn, issue="example/repo#57", title="Recovered stage", workspace_path=workspace)
+    wf.set_enabled(conn, True)
+    finish(conn, kb.claim_task(conn, tid))
+    critic = kb.claim_task(conn, tid)
+    # Failure state survives the failed run when a quota-limited worker is requeued.
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET last_failure_error='provider quota exhausted', "
+                     "consecutive_failures=1 WHERE id=?", (tid,))
+    assert kbd.check_respawn_guard(conn, tid) == "blocker_auth"
+    finish(conn, critic, handoff(conn, critic, decision))
+    task = kb.get_task(conn, tid)
+    assert task.current_step_key == ("implement" if decision == "pass" else "plan")
+    assert kbd.check_respawn_guard(conn, tid) is None
+    assert (task.consecutive_failures, task.last_failure_error) == (0, None)
+    result = kbd.dispatch_once(conn, board="delivery", dry_run=True, reconcile_orphans=False)
+    assert [row[:2] for row in result.spawned] == [(tid, task.assignee)]
+
+
+def test_operator_retry_clears_failure_without_discarding_upstream_evidence(board):
+    _, conn, workspace = board
+    tid = wf.start(conn, issue="example/repo#58", title="Recovered provider", workspace_path=workspace)
+    wf.set_enabled(conn, True)
+    finish(conn, kb.claim_task(conn, tid))
+    task = kb.claim_task(conn, tid)
+    kb.block_task(conn, tid, reason="Provider authentication failed", kind="needs_input",
+                  expected_run_id=task.current_run_id)
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET last_failure_error='provider quota exhausted', "
+                     "consecutive_failures=1 WHERE id=?", (tid,))
+    current = wf.state(conn, tid)
+    blocked = kb.get_task(conn, tid)
+    kwargs = dict(expected_revision=current["revision"], packet_digest=wf.digest(current["evidence"]),
+                  decision="retry", note="Operator confirms provider recovery", decision_id="retry-provider")
+    with pytest.raises(ValueError, match="packet changed"):
+        wf.decide(conn, tid, **{**kwargs, "packet_digest": "stale"})
+    assert kbd.check_respawn_guard(conn, tid) == "blocker_auth"
+    wf.decide(conn, tid, **kwargs)
+    task = kb.get_task(conn, tid)
+    assert task.status == "ready" and task.current_step_key == "critique"
+    assert wf.state(conn, tid)["evidence"] == current["evidence"]
+    assert kbd.check_respawn_guard(conn, tid) is None
+    assert (task.consecutive_failures, task.last_failure_error) == (0, None)
+    # Like native unblock, retry preserves recurrence history until work succeeds.
+    assert (task.block_kind, task.block_recurrences) == (blocked.block_kind, blocked.block_recurrences)
+
+
 def test_configure_does_not_convert_legacy_cards_and_validates_references(board):
     _, conn, _ = board
     kb.create_board("occupied")
