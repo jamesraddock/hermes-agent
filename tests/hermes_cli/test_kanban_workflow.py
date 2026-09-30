@@ -471,6 +471,46 @@ def test_idle_upgrade_resumes_reviewed_card_through_pr_before_merge(board, monke
     assert len(kb.list_tasks(conn)) == 1
 
 
+def test_idle_upgrade_changes_model_without_stranding_existing_card(board):
+    from hermes_cli import kanban_workflow_recovery as recovery
+    _, conn, workspace = board
+    tid = wf.start(conn, issue='example/repo#81', title='Retained route', workspace_path=workspace)
+    wf.set_enabled(conn, True)
+    for _ in range(2):
+        finish(conn, kb.claim_task(conn, tid))
+    before = wf.state(conn, tid)
+    task = kb.get_task(conn, tid)
+    assert task is not None
+    assert (task.current_step_key, task.model_override, task.status) == ('implement', 'test-model', 'ready')
+    new = definition()
+    new['steps']['implement']['model'] = 'new-model'
+    args = dict(expected_digest=wf.digest(definition()), note='Operator-approved model route upgrade')
+    wf.set_enabled(conn, False)
+    changed_provider = copy.deepcopy(new)
+    changed_provider['steps']['implement']['provider'] = 'different-provider'
+    with pytest.raises(ValueError, match='preserve roles'):
+        recovery.upgrade(conn, changed_provider, **args)
+    conn.execute("UPDATE tasks SET model_override='unexpected-model' WHERE id=?", (tid,))
+    with pytest.raises(ValueError, match='pinned stage route'):
+        recovery.upgrade(conn, new, **args)
+    assert wf.configuration(conn)[0] == definition()
+    assert wf.state(conn, tid)['revision'] == before['revision']
+    conn.execute("UPDATE tasks SET model_override='test-model' WHERE id=?", (tid,))
+    receipt = recovery.upgrade(conn, new, **args)
+    assert receipt['previous_digest'] == args['expected_digest']
+    assert wf.state(conn, tid)['evidence'] == before['evidence']
+    assert wf.state(conn, tid)['revision'] == before['revision'] + 1
+    task = kb.get_task(conn, tid)
+    assert task is not None
+    assert (task.id, task.current_step_key, task.model_override, task.provider_override,
+            task.reasoning_effort, task.status) == (tid, 'implement', 'new-model', 'test-provider', 'high', 'ready')
+    assert any(event.kind == 'workflow_upgraded' for event in kb.list_events(conn, tid))
+    assert not wf.configuration(conn)[1]
+    wf.set_enabled(conn, True)
+    claimed = kb.claim_task(conn, tid)
+    assert claimed and claimed.model_override == 'new-model' and claimed.current_step_key == 'implement'
+
+
 def test_correction_resume_keeps_plan_and_requires_actual_resolution(board):
     """Repeated verification findings remain visible through a targeted recovery."""
     from hermes_cli import kanban as cli

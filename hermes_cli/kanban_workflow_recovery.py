@@ -23,7 +23,7 @@ def _compatible(old, new):
     added = set(new['steps']) - set(old['steps'])
     if any(new['steps'][name].get('hold') for name in added):
         raise ValueError('upgrade may insert worker stages, not new approval or terminal stages')
-    mutable = {'instruction', 'next', 'resume_steps', 'approval_inputs', 'resolve_findings'}
+    mutable = {'instruction', 'next', 'resume_steps', 'approval_inputs', 'resolve_findings', 'model'}
     for name, before in old['steps'].items():
         after = new['steps'].get(name)
         if after is None or {k: v for k, v in before.items() if k not in mutable} != {
@@ -57,7 +57,8 @@ def upgrade(conn, definition, *, expected_digest, note):
         if conn.execute('SELECT 1 FROM kanban_workflow_migrations WHERE finalized=0 LIMIT 1').fetchone():
             raise ValueError('finish pending ownership transfers before upgrading')
         _compatible(old, definition)
-        tasks = conn.execute('SELECT id, current_step_key FROM tasks WHERE workflow_template_id=? AND status!=?',
+        tasks = conn.execute('SELECT id, current_step_key, model_override, provider_override, '
+                             'reasoning_effort FROM tasks WHERE workflow_template_id=? AND status!=?',
                              (old['id'], 'archived')).fetchall()
         receipt = {'previous_digest': expected_digest, 'definition_digest': wf.digest(definition),
                    'note': note, 'recorded_at': int(time.time()), 'actor_surface': 'local-operator-cli',
@@ -65,6 +66,15 @@ def upgrade(conn, definition, *, expected_digest, note):
         for task in tasks:
             if task['current_step_key'] not in definition['steps']:
                 raise ValueError('upgrade would strand an existing card')
+            before_step = old['steps'][task['current_step_key']]
+            after_step = definition['steps'][task['current_step_key']]
+            if before_step.get('model') != after_step.get('model'):
+                if (task['model_override'] != before_step['model']
+                        or task['provider_override'] != before_step['provider']
+                        or task['reasoning_effort'] != before_step['effort']):
+                    raise ValueError('model upgrade requires the existing card to match its pinned stage route')
+                conn.execute('UPDATE tasks SET model_override=? WHERE id=?',
+                             (after_step['model'], task['id']))
             kb._append_event(conn, task['id'], 'workflow_upgraded', receipt)
             # A definition change invalidates a previously-read operator decision packet.
             conn.execute('UPDATE kanban_workflow_state SET revision=revision+1 WHERE task_id=?', (task['id'],))
